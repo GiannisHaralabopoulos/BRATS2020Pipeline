@@ -82,10 +82,16 @@ DEFAULT_CFG = {
     "checkpoint":      None,          # path to resume from
     "save_dir":        "./runs",
     "log_interval":    10,            # steps between console/tb logs
+    "early_stopping_patience": 100,  # stop if no Dice improvement for N epochs
 
     # Diff-UNet specific
     "diffusion_steps": 1000,
     "diffusion_infer_steps": 10,
+
+    # Cross-validation
+    "cv":              False,   # enable k-fold CV
+    "n_folds":         10,      # number of folds
+    "test_ratio":      0.10,    # fraction held out as final test set (never seen during CV)
 
     # Augmentation
     "augment":         True,
@@ -291,12 +297,59 @@ class BraTS2020Dataset(Dataset):
 
 
 def make_splits(patient_dirs: List[Path], val_ratio: float, seed: int):
+    """Simple single train/val split (used when CV is disabled)."""
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(patient_dirs))
     n_val = max(1, int(len(patient_dirs) * val_ratio))
     val_idx   = perm[:n_val]
     train_idx = perm[n_val:]
     return [patient_dirs[i] for i in train_idx], [patient_dirs[i] for i in val_idx]
+
+
+def make_cv_splits(
+    patient_dirs: List[Path],
+    n_folds: int,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[List[Path], List[Tuple[List[Path], List[Path]]]]:
+    """
+    Partition patients into:
+      • a held-out test set  (``test_ratio`` of the full pool, e.g. 10 %)
+      • k stratified folds   (over the remaining 90 %)
+
+    Returns
+    -------
+    test_patients : List[Path]
+        Patients that are NEVER used during cross-validation.
+    folds : List[Tuple[List[Path], List[Path]]]
+        List of (train_patients, val_patients) for each fold.
+        len(folds) == n_folds.
+    """
+    rng  = np.random.default_rng(seed)
+    perm = rng.permutation(len(patient_dirs)).tolist()
+
+    # ── 1. carve out the held-out test set ──────────────────────────────────
+    n_test       = max(1, int(len(patient_dirs) * test_ratio))
+    test_idx     = perm[:n_test]
+    trainval_idx = perm[n_test:]
+    test_patients = [patient_dirs[i] for i in test_idx]
+
+    # ── 2. k-fold split over the remaining patients ──────────────────────────
+    n_tv   = len(trainval_idx)
+    fold_size = n_tv // n_folds   # patients per validation fold
+    folds: List[Tuple[List[Path], List[Path]]] = []
+
+    for k in range(n_folds):
+        val_start = k * fold_size
+        val_end   = val_start + fold_size if k < n_folds - 1 else n_tv  # last fold gets remainder
+        val_idx_k   = trainval_idx[val_start:val_end]
+        train_idx_k = trainval_idx[:val_start] + trainval_idx[val_end:]
+        folds.append((
+            [patient_dirs[i] for i in train_idx_k],
+            [patient_dirs[i] for i in val_idx_k],
+        ))
+
+    return test_patients, folds
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1008,7 +1061,14 @@ def is_2d_model(cfg: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Trainer:
-    def __init__(self, cfg: dict, logger: logging.Logger):
+    def __init__(
+        self,
+        cfg: dict,
+        logger: logging.Logger,
+        train_pts: Optional[List[Path]] = None,
+        val_pts:   Optional[List[Path]] = None,
+        run_suffix: str = "",
+    ):
         self.cfg    = cfg
         self.logger = logger
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1017,10 +1077,12 @@ class Trainer:
         np.random.seed(cfg["seed"])
 
         # ── data ──
-        all_patients = find_patient_dirs(cfg["data_dir"])
-        if not all_patients:
-            raise RuntimeError(f"No BraTS patient dirs found in {cfg['data_dir']}")
-        train_pts, val_pts = make_splits(all_patients, cfg["val_ratio"], cfg["seed"])
+        if train_pts is None or val_pts is None:
+            # Stand-alone (non-CV) mode: derive split from config
+            all_patients = find_patient_dirs(cfg["data_dir"])
+            if not all_patients:
+                raise RuntimeError(f"No BraTS patient dirs found in {cfg['data_dir']}")
+            train_pts, val_pts = make_splits(all_patients, cfg["val_ratio"], cfg["seed"])
         logger.info(f"Patients → train: {len(train_pts)}, val: {len(val_pts)}")
 
         if is_2d_model(cfg):
@@ -1074,12 +1136,14 @@ class Trainer:
         self.scaler    = GradScaler(enabled=cfg["amp"])
 
         # ── checkpointing & logging ──
-        run_name   = f"{cfg['model']}_{datetime.now():%Y%m%d_%H%M%S}"
+        tag      = f"_{run_suffix}" if run_suffix else ""
+        run_name = f"{cfg['model']}_{datetime.now():%Y%m%d_%H%M%S}{tag}"
         self.run_dir = Path(cfg["save_dir"]) / run_name
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.writer    = SummaryWriter(self.run_dir / "tb")
-        self.best_dice = 0.0
-        self.start_ep  = 1
+        self.best_dice   = 0.0
+        self.epochs_no_improve = 0
+        self.start_ep    = 1
 
         # ── resume ──
         if cfg.get("checkpoint"):
@@ -1181,12 +1245,24 @@ class Trainer:
                     self.sched.step()
             self.writer.add_scalar("train/lr", self.opt.param_groups[0]["lr"], epoch)
 
-            # Checkpoint
+            # Checkpoint + early stopping
             mean_dice = float(np.mean([val_m.get(f"dice_{n}", 0) for n in REGION_NAMES]))
             is_best   = mean_dice > self.best_dice
             if is_best:
-                self.best_dice = mean_dice
+                self.best_dice       = mean_dice
+                self.epochs_no_improve = 0
+            else:
+                self.epochs_no_improve += 1
             self._save_checkpoint(epoch, mean_dice, is_best)
+            self.writer.add_scalar("val/epochs_no_improve", self.epochs_no_improve, epoch)
+
+            patience = cfg["early_stopping_patience"]
+            if self.epochs_no_improve >= patience:
+                logger.info(
+                    f"Early stopping triggered: no Dice improvement for "
+                    f"{patience} consecutive epochs (best={self.best_dice:.4f})."
+                )
+                break
 
         logger.info(f"Training complete. Best mean Dice: {self.best_dice:.4f}")
         self.writer.close()
@@ -1195,12 +1271,13 @@ class Trainer:
 
     def _save_checkpoint(self, epoch: int, dice: float, is_best: bool):
         state = {
-            "epoch":      epoch,
-            "model":      self.cfg["model"],
-            "state_dict": self.model.state_dict(),
-            "optimizer":  self.opt.state_dict(),
-            "dice":       dice,
-            "cfg":        self.cfg,
+            "epoch":             epoch,
+            "model":             self.cfg["model"],
+            "state_dict":        self.model.state_dict(),
+            "optimizer":         self.opt.state_dict(),
+            "dice":              dice,
+            "epochs_no_improve": self.epochs_no_improve,
+            "cfg":               self.cfg,
         }
         path = self.run_dir / "last.pth"
         torch.save(state, path)
@@ -1212,9 +1289,14 @@ class Trainer:
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["state_dict"])
         self.opt.load_state_dict(ckpt["optimizer"])
-        self.start_ep  = ckpt["epoch"] + 1
-        self.best_dice = ckpt.get("dice", 0.0)
-        self.logger.info(f"Resumed from {path} (ep {ckpt['epoch']}, dice {self.best_dice:.4f})")
+        self.start_ep          = ckpt["epoch"] + 1
+        self.best_dice         = ckpt.get("dice", 0.0)
+        self.epochs_no_improve = ckpt.get("epochs_no_improve", 0)
+        self.logger.info(
+            f"Resumed from {path} "
+            f"(ep {ckpt['epoch']}, dice {self.best_dice:.4f}, "
+            f"no-improve streak {self.epochs_no_improve})"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1292,6 +1374,271 @@ class Evaluator:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CROSS-VALIDATION RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CrossValidationRunner:
+    """
+    Orchestrates k-fold cross-validation with a held-out test set.
+
+    Workflow
+    --------
+    1. Hold out ``test_ratio`` (default 10 %) of patients → never touched
+       during CV.
+    2. Split the remaining patients into ``n_folds`` folds.
+    3. For each fold: train a fresh model, save best checkpoint, record
+       per-fold validation Dice.
+    4. After all folds: evaluate every best checkpoint on the held-out test
+       set and report aggregated statistics.
+    5. Write three CSVs to ``save_dir``:
+         cv_fold_summary.csv      – per-fold val Dice (WT/TC/ET + mean)
+         cv_test_per_patient.csv  – per-patient test Dice for each fold model
+         cv_test_summary.csv      – mean ± std across fold models on test set
+    """
+
+    def __init__(self, cfg: dict, logger: logging.Logger):
+        self.cfg    = cfg
+        self.logger = logger
+        self.save_dir = Path(cfg["save_dir"])
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        all_patients = find_patient_dirs(cfg["data_dir"])
+        if not all_patients:
+            raise RuntimeError(f"No BraTS patient dirs found in {cfg['data_dir']}")
+
+        self.test_patients, self.folds = make_cv_splits(
+            all_patients,
+            n_folds    = cfg["n_folds"],
+            test_ratio = cfg["test_ratio"],
+            seed       = cfg["seed"],
+        )
+        logger.info(
+            f"CV setup: {len(all_patients)} total patients | "
+            f"{len(self.test_patients)} held-out test | "
+            f"{len(self.folds)} folds of "
+            f"~{len(self.folds[0][0])} train / ~{len(self.folds[0][1])} val"
+        )
+
+        # Persist the split so results are reproducible
+        split_info = {
+            "test_patients": [str(p) for p in self.test_patients],
+            "folds": [
+                {"train": [str(p) for p in tr], "val": [str(p) for p in va]}
+                for tr, va in self.folds
+            ],
+        }
+        with open(self.save_dir / "cv_split.json", "w") as f:
+            json.dump(split_info, f, indent=2)
+
+    # ── per-fold evaluation on the test set ──────────────────────────────────
+
+    def _eval_checkpoint_on_test(
+        self,
+        ckpt_path: Path,
+        fold_idx:  int,
+    ) -> List[Dict]:
+        """Run the saved best model over all held-out test patients."""
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt   = torch.load(str(ckpt_path), map_location=device)
+        model  = build_model(self.cfg).to(device)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+
+        if is_2d_model(self.cfg):
+            ds = BraTS2020SliceDataset(
+                self.test_patients, self.cfg["patch_size"],
+                augment=False, skip_empty_ratio=0.0,
+            )
+            batch_size = self.cfg["batch_size"]
+        else:
+            ds = BraTS2020Dataset(
+                self.test_patients, self.cfg["patch_size"], augment=False,
+            )
+            batch_size = 1
+
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                            num_workers=self.cfg["num_workers"], pin_memory=True)
+
+        # Accumulate per-patient Dice (aggregate slices for 2-D model)
+        patient_scores: Dict[str, Dict[str, List[float]]] = {}
+
+        with torch.no_grad():
+            for image, label, pids in loader:
+                image = image.to(device)
+                with autocast():
+                    pred = model(image) if not isinstance(model, DiffUNet) \
+                           else model(image)
+                pred_bin = (torch.sigmoid(pred).cpu().float() > 0.5).numpy()
+                label_np = label.float().numpy()
+
+                for b, raw_pid in enumerate(pids):
+                    # For 2-D: strip the _z### suffix to group by patient
+                    pid = raw_pid.rsplit("_z", 1)[0] if is_2d_model(self.cfg) else raw_pid
+                    if pid not in patient_scores:
+                        patient_scores[pid] = {n: [] for n in REGION_NAMES}
+                    for ci, name in enumerate(REGION_NAMES):
+                        patient_scores[pid][name].append(
+                            dice_score(pred_bin[b, ci], label_np[b, ci])
+                        )
+
+        rows = []
+        for pid, scores in patient_scores.items():
+            row = {"fold": fold_idx, "patient": pid}
+            for name in REGION_NAMES:
+                row[f"dice_{name}"] = round(float(np.mean(scores[name])), 4)
+            rows.append(row)
+        return rows
+
+    # ── main CV loop ──────────────────────────────────────────────────────────
+
+    def run(self):
+        logger        = self.logger
+        cfg           = self.cfg
+        fold_summary  = []   # one row per fold
+        all_test_rows = []   # one row per (fold, patient)
+
+        for k, (train_pts, val_pts) in enumerate(self.folds, start=1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"  FOLD {k} / {cfg['n_folds']}")
+            logger.info(f"{'='*60}")
+
+            # Fresh trainer for this fold
+            trainer = Trainer(
+                cfg,
+                logger,
+                train_pts  = train_pts,
+                val_pts    = val_pts,
+                run_suffix = f"fold{k:02d}",
+            )
+            trainer.run()
+
+            # Record best val Dice for this fold
+            fold_row = {
+                "fold":      k,
+                "best_dice": round(trainer.best_dice, 4),
+            }
+            # Re-validate best checkpoint to get per-region breakdown
+            best_ckpt = trainer.run_dir / "best.pth"
+            if best_ckpt.exists():
+                ckpt = torch.load(str(best_ckpt), map_location="cpu")
+                # The checkpoint doesn't store per-region val metrics directly,
+                # so we do a quick re-validation pass here.
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model  = build_model(cfg).to(device)
+                model.load_state_dict(ckpt["state_dict"])
+                model.eval()
+                per_region = {n: [] for n in REGION_NAMES}
+                if is_2d_model(cfg):
+                    val_ds = BraTS2020SliceDataset(val_pts, cfg["patch_size"], augment=False)
+                else:
+                    val_ds = BraTS2020Dataset(val_pts, cfg["patch_size"], augment=False)
+                val_loader = DataLoader(
+                    val_ds, batch_size=1, shuffle=False,
+                    num_workers=cfg["num_workers"], pin_memory=True,
+                )
+                with torch.no_grad():
+                    for img, lbl, _ in val_loader:
+                        img = img.to(device)
+                        with autocast():
+                            out = model(img)
+                        m = evaluate_batch(torch.sigmoid(out), lbl)
+                        for name in REGION_NAMES:
+                            per_region[name].append(m[f"dice_{name}"])
+                for name in REGION_NAMES:
+                    fold_row[f"val_dice_{name}"] = round(float(np.mean(per_region[name])), 4)
+                fold_row["val_dice_mean"] = round(
+                    float(np.mean([fold_row[f"val_dice_{n}"] for n in REGION_NAMES])), 4
+                )
+
+                # Evaluate on held-out test set
+                logger.info(f"  Evaluating fold {k} best checkpoint on held-out test set …")
+                test_rows = self._eval_checkpoint_on_test(best_ckpt, fold_idx=k)
+                all_test_rows.extend(test_rows)
+                for name in REGION_NAMES:
+                    fold_row[f"test_dice_{name}"] = round(
+                        float(np.mean([r[f"dice_{name}"] for r in test_rows])), 4
+                    )
+                fold_row["test_dice_mean"] = round(
+                    float(np.mean([fold_row[f"test_dice_{n}"] for n in REGION_NAMES])), 4
+                )
+                logger.info(
+                    f"  Fold {k} | val_mean={fold_row['val_dice_mean']:.4f} | "
+                    f"test_mean={fold_row['test_dice_mean']:.4f}"
+                )
+
+            fold_summary.append(fold_row)
+
+        # ── aggregate and write CSVs ──────────────────────────────────────────
+        self._write_cv_summaries(fold_summary, all_test_rows)
+
+    def _write_cv_summaries(
+        self,
+        fold_summary:  List[Dict],
+        all_test_rows: List[Dict],
+    ):
+        logger = self.logger
+
+        # 1. Per-fold val + test summary
+        summary_path = self.save_dir / "cv_fold_summary.csv"
+        if fold_summary:
+            with open(summary_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fold_summary[0].keys())
+                writer.writeheader()
+                writer.writerows(fold_summary)
+
+            # Append a MEAN ± STD row
+            numeric_keys = [k for k in fold_summary[0] if k != "fold"]
+            stats_row = {"fold": "MEAN±STD"}
+            for k in numeric_keys:
+                vals = [r[k] for r in fold_summary if isinstance(r.get(k), (int, float))]
+                if vals:
+                    stats_row[k] = f"{np.mean(vals):.4f}±{np.std(vals):.4f}"
+            with open(summary_path, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=fold_summary[0].keys()).writerow(stats_row)
+
+        logger.info(f"Fold summary → {summary_path}")
+
+        # 2. Per-patient test results
+        if all_test_rows:
+            test_pp_path = self.save_dir / "cv_test_per_patient.csv"
+            with open(test_pp_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=all_test_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(all_test_rows)
+            logger.info(f"Per-patient test results → {test_pp_path}")
+
+            # 3. Test set aggregate summary
+            test_summary_path = self.save_dir / "cv_test_summary.csv"
+            agg: Dict[str, List[float]] = {f"dice_{n}": [] for n in REGION_NAMES}
+            for row in all_test_rows:
+                for name in REGION_NAMES:
+                    agg[f"dice_{name}"].append(row[f"dice_{name}"])
+
+            summary_rows = []
+            for metric, vals in agg.items():
+                summary_rows.append({
+                    "metric": metric,
+                    "mean":   round(float(np.nanmean(vals)), 4),
+                    "std":    round(float(np.nanstd(vals)),  4),
+                    "median": round(float(np.nanmedian(vals)), 4),
+                    "min":    round(float(np.nanmin(vals)),  4),
+                    "max":    round(float(np.nanmax(vals)),  4),
+                })
+            with open(test_summary_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=summary_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(summary_rows)
+
+            logger.info(f"Test set summary → {test_summary_path}")
+            logger.info("\n=== CROSS-VALIDATION COMPLETE ===")
+            for row in summary_rows:
+                logger.info(
+                    f"  {row['metric']:12s}  mean={row['mean']:.4f}  "
+                    f"std={row['std']:.4f}  median={row['median']:.4f}"
+                )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1327,7 +1674,18 @@ def parse_args():
     p.add_argument("--seed",       type=int, default=None)
     p.add_argument("--checkpoint", default=None, help="Path to .pth checkpoint")
     p.add_argument("--save_dir",   default=None, help="Directory for run outputs")
+    p.add_argument("--log_interval", type=int, default=None)
+    p.add_argument("--early_stopping_patience", type=int, default=None,
+                   help="Stop training if mean Dice does not improve for N epochs (default 100)")
     p.add_argument("--no_augment", action="store_true")
+
+    # Cross-validation
+    p.add_argument("--cv",         action="store_true",
+                   help="Run k-fold cross-validation instead of a single train run")
+    p.add_argument("--n_folds",    type=int, default=None,
+                   help="Number of CV folds (default 10)")
+    p.add_argument("--test_ratio", type=float, default=None,
+                   help="Fraction of patients held out as a test set, never used during CV (default 0.10)")
 
     return p.parse_args()
 
@@ -1362,7 +1720,9 @@ def main():
     logger.info(f"Mode: {cfg['mode']} | Model: {cfg['model']} | Device: "
                 f"{'CUDA' if torch.cuda.is_available() else 'CPU'}")
 
-    if cfg["mode"] == "train":
+    if cfg.get("cv"):
+        CrossValidationRunner(cfg, logger).run()
+    elif cfg["mode"] == "train":
         Trainer(cfg, logger).run()
     else:
         Evaluator(cfg, logger).run()
