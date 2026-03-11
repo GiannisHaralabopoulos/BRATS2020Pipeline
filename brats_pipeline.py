@@ -362,7 +362,8 @@ def hausdorff95(pred: np.ndarray, target: np.ndarray) -> float:
 
 def evaluate_batch(preds: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
     """
-    preds, targets: (B, 3, H, W, D) – binary after threshold.
+    Works for both 2-D slices  (B, 3, H, W)
+    and         3-D volumes    (B, 3, H, W, D).
     Returns mean Dice per region.
     """
     preds   = (preds.detach().cpu().float() > 0.5).numpy()
@@ -812,15 +813,172 @@ class HVUNet(nn.Module):
         return self.head(d1)
 
 
+# ── 6. Simple 2D UNet ────────────────────────────────────────────────────────
+
+class ConvBnRelu2D(nn.Sequential):
+    """2-D counterpart of ConvBnRelu used by UNet2D."""
+    def __init__(self, in_c, out_c, kernel=3, stride=1, padding=1):
+        super().__init__(
+            nn.Conv2d(in_c, out_c, kernel, stride=stride, padding=padding, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True),
+        )
+
+
+class UNet2D(nn.Module):
+    """
+    Classic 2-D U-Net (Ronneberger et al., 2015).
+
+    Operates on individual axial slices: input  (B, 4, H, W)
+                                         output (B, 3, H, W)
+
+    Encoder depth: 4 levels with MaxPool2d(2).
+    Decoder uses bilinear upsampling (no checkerboard artefacts) followed
+    by a double-conv block, and skip connections at every level.
+
+    Compared to the 3-D models this is much lighter (~1 M params at
+    base_filters=32) and trains well on a single consumer GPU.
+    """
+
+    def __init__(self, in_channels: int = 4, out_channels: int = 3,
+                 base_filters: int = 32):
+        super().__init__()
+        f = base_filters
+
+        def double_conv(ic, oc):
+            return nn.Sequential(ConvBnRelu2D(ic, oc), ConvBnRelu2D(oc, oc))
+
+        # ── encoder ──────────────────────────────────────────────────────────
+        self.enc1 = double_conv(in_channels, f)       #  f   × H   × W
+        self.enc2 = double_conv(f,    f * 2)           #  2f  × H/2 × W/2
+        self.enc3 = double_conv(f*2,  f * 4)           #  4f  × H/4 × W/4
+        self.enc4 = double_conv(f*4,  f * 8)           #  8f  × H/8 × W/8
+        self.pool = nn.MaxPool2d(2)
+
+        # ── bottleneck ───────────────────────────────────────────────────────
+        self.bottleneck = double_conv(f*8, f * 16)     # 16f  × H/16 × W/16
+
+        # ── decoder (bilinear up + double-conv) ──────────────────────────────
+        self.up4   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.dec4  = double_conv(f*16 + f*8,  f * 8)
+
+        self.up3   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.dec3  = double_conv(f*8  + f*4,  f * 4)
+
+        self.up2   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.dec2  = double_conv(f*4  + f*2,  f * 2)
+
+        self.up1   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.dec1  = double_conv(f*2  + f,    f)
+
+        # ── 1×1 output projection ─────────────────────────────────────────────
+        self.head  = nn.Conv2d(f, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 4, H, W)
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b  = self.bottleneck(self.pool(e4))
+
+        d4 = self.dec4(torch.cat([self.up4(b),  e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return self.head(d1)          # (B, 3, H, W)
+
+
+# ── 2-D Slice Dataset ─────────────────────────────────────────────────────────
+
+class BraTS2020SliceDataset(Dataset):
+    """
+    Thin wrapper around BraTS2020Dataset that decomposes each 3-D volume
+    into individual axial slices for use with UNet2D.
+
+    Returns:
+        image  – (4, H, W) float32  (one axial slice, all modalities)
+        label  – (3, H, W) float32  (WT / TC / ET for that slice)
+        pid    – "<patient_id>_z<slice_index>" string
+    """
+
+    def __init__(
+        self,
+        patient_dirs: List[Path],
+        patch_size: Tuple[int, int, int] = (128, 128, 128),
+        augment: bool = False,
+        flip_prob: float = 0.5,
+        intensity_prob: float = 0.3,
+        skip_empty_ratio: float = 0.9,
+        cache_rate: float = 0.0,
+    ):
+        """
+        skip_empty_ratio: fraction of all-background slices to randomly drop
+                          during dataset construction (keeps training balanced).
+        """
+        # Reuse 3-D loader for I/O and normalisation
+        self._vol_ds = BraTS2020Dataset(
+            patient_dirs, patch_size, augment=False, cache_rate=cache_rate
+        )
+        self.augment          = augment
+        self.flip_prob        = flip_prob
+        self.intensity_prob   = intensity_prob
+        self.skip_empty_ratio = skip_empty_ratio
+
+        # Build index: list of (vol_idx, slice_z)
+        self._index: List[Tuple[int, int]] = []
+        rng = np.random.default_rng(0)
+        for vi in range(len(self._vol_ds)):
+            _, label, _ = self._vol_ds[vi]          # (3, H, W, D)
+            D = label.shape[-1]
+            for z in range(D):
+                has_fg = label[:, :, :, z].sum() > 0
+                if not has_fg and rng.random() < skip_empty_ratio:
+                    continue
+                self._index.append((vi, z))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int):
+        vi, z = self._index[idx]
+        image, label, pid = self._vol_ds[vi]          # (4,H,W,D), (3,H,W,D)
+
+        img_sl  = image[:, :, :, z].numpy()           # (4, H, W)
+        lbl_sl  = label[:, :, :, z].numpy()           # (3, H, W)
+
+        # ── 2-D augmentation ─────────────────────────────────────────────────
+        if self.augment:
+            # Random horizontal/vertical flip
+            for axis in [1, 2]:
+                if np.random.rand() < self.flip_prob:
+                    img_sl = np.flip(img_sl, axis=axis).copy()
+                    lbl_sl = np.flip(lbl_sl, axis=axis).copy()
+            # Random intensity shift / scale per modality
+            if np.random.rand() < self.intensity_prob:
+                for c in range(img_sl.shape[0]):
+                    img_sl[c] = img_sl[c] * np.random.uniform(0.9, 1.1) \
+                                           + np.random.uniform(-0.1, 0.1)
+
+        return (
+            torch.from_numpy(img_sl.copy()).float(),
+            torch.from_numpy(lbl_sl.copy()).float(),
+            f"{pid}_z{z:03d}",
+        )
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 MODEL_REGISTRY = {
+    "unet2d":          UNet2D,          # ← simple 2-D slice-based U-Net (new)
     "unet3d":          UNet3D,
     "attention_unet":  AttentionUNet3D,
     "equiunet":        EquiUnet,
     "diff_unet":       DiffUNet,
     "hvu":             HVUNet,
 }
+
+IS_2D_MODEL = {"unet2d"}
 
 
 def build_model(cfg: dict) -> nn.Module:
@@ -837,7 +995,12 @@ def build_model(cfg: dict) -> nn.Module:
     if name == "equiunet":
         kwargs.pop("base_filters")
         kwargs["width"] = cfg["base_filters"]
+    # UNet2D uses 2-D convolutions – no extra kwargs needed
     return MODEL_REGISTRY[name](**kwargs)
+
+
+def is_2d_model(cfg: dict) -> bool:
+    return cfg["model"].lower() in IS_2D_MODEL
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -860,21 +1023,36 @@ class Trainer:
         train_pts, val_pts = make_splits(all_patients, cfg["val_ratio"], cfg["seed"])
         logger.info(f"Patients → train: {len(train_pts)}, val: {len(val_pts)}")
 
-        self.train_ds = BraTS2020Dataset(
-            train_pts, cfg["patch_size"], augment=cfg["augment"],
-            flip_prob=cfg["flip_prob"], rotate_prob=cfg["rotate_prob"],
-            intensity_prob=cfg["intensity_prob"], cache_rate=cfg["cache_rate"],
-        )
-        self.val_ds = BraTS2020Dataset(
-            val_pts, cfg["patch_size"], augment=False, cache_rate=cfg["cache_rate"],
-        )
+        if is_2d_model(cfg):
+            # UNet2D works on axial slices – use the slice dataset
+            logger.info("2-D mode: building per-slice datasets (axial slices)")
+            self.train_ds = BraTS2020SliceDataset(
+                train_pts, cfg["patch_size"], augment=cfg["augment"],
+                flip_prob=cfg["flip_prob"], intensity_prob=cfg["intensity_prob"],
+                cache_rate=cfg["cache_rate"],
+            )
+            self.val_ds = BraTS2020SliceDataset(
+                val_pts, cfg["patch_size"], augment=False,
+                skip_empty_ratio=0.95,     # keep most empties for val stability
+                cache_rate=cfg["cache_rate"],
+            )
+            logger.info(f"Slices → train: {len(self.train_ds)}, val: {len(self.val_ds)}")
+        else:
+            self.train_ds = BraTS2020Dataset(
+                train_pts, cfg["patch_size"], augment=cfg["augment"],
+                flip_prob=cfg["flip_prob"], rotate_prob=cfg["rotate_prob"],
+                intensity_prob=cfg["intensity_prob"], cache_rate=cfg["cache_rate"],
+            )
+            self.val_ds = BraTS2020Dataset(
+                val_pts, cfg["patch_size"], augment=False, cache_rate=cfg["cache_rate"],
+            )
         self.train_loader = DataLoader(
             self.train_ds, batch_size=cfg["batch_size"], shuffle=True,
             num_workers=cfg["num_workers"], pin_memory=True, drop_last=True,
         )
         self.val_loader = DataLoader(
-            self.val_ds, batch_size=1, shuffle=False,
-            num_workers=cfg["num_workers"], pin_memory=True,
+            self.val_ds, batch_size=cfg["batch_size"] if is_2d_model(cfg) else 1,
+            shuffle=False, num_workers=cfg["num_workers"], pin_memory=True,
         )
 
         # ── model ──
@@ -1160,6 +1338,7 @@ def main():
     if args.list_models:
         print("\nAvailable models:")
         descriptions = {
+            "unet2d":         "Simple 2-D U-Net on axial slices (fast, low VRAM)",
             "unet3d":         "Vanilla 3D U-Net (mtancak/PyTorch-UNet)",
             "attention_unet": "Attention U-Net 3D (mahdizynali/BraTS2020-TF → PyTorch)",
             "equiunet":       "EquiUnet, Top-10 BraTS2020 (lescientifik/open_brats2020)",
