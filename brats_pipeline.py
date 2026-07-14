@@ -51,6 +51,11 @@ try:
 except ImportError:
     raise ImportError("nibabel is required: pip install nibabel")
 
+try:
+    import torchio as tio           # data augmentation (rotation, scaling, noise, elastic, …)
+except ImportError:
+    tio = None                       # only required when augment=True
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,20 +65,20 @@ DEFAULT_CFG = {
     "data_dir":        "./BraTS2020",
     "train_csv":       None,          # optional explicit split CSV
     "val_ratio":       0.2,
-    "patch_size":      (128, 128, 128),
+    "patch_size":      (240, 240, 155),   # full native BraTS2020 geometry (H, W, D); model sees 4 modalities
     "num_workers":     4,
     "cache_rate":      0.0,           # fraction of dataset kept in RAM
 
     # Model
     "model":           "unet3d",      # see MODEL_REGISTRY
     "in_channels":     4,
-    "num_classes":     4,             # background + WT + TC + ET (one-hot output)
+    "num_classes":     4,             # 0=background, 1=NCR/NET, 2=edema, 3=ET (mutually exclusive)
     "base_filters":    32,
 
     # Training
     "mode":            "train",
-    "epochs":          200,
-    "batch_size":      1,
+    "epochs":          300,
+    "batch_size":      4,
     "lr":              1e-4,
     "weight_decay":    1e-5,
     "scheduler":       "cosine",      # cosine | plateau | none
@@ -93,11 +98,13 @@ DEFAULT_CFG = {
     "n_folds":         10,      # number of folds
     "test_ratio":      0.10,    # fraction held out as final test set (never seen during CV)
 
-    # Augmentation
+    # Augmentation (applied with TorchIO; see build_augmentation)
     "augment":         True,
-    "flip_prob":       0.5,
-    "rotate_prob":     0.3,
-    "intensity_prob":  0.3,
+    "flip_prob":       0.5,    # random axis flips
+    "affine_prob":     0.3,    # random affine: rotation + geometric scaling
+    "elastic_prob":    0.2,    # random elastic deformation (3-D only)
+    "noise_prob":      0.2,    # additive Gaussian noise
+    "intensity_prob":  0.3,    # smooth intensity inhomogeneity (bias field)
 }
 
 
@@ -135,6 +142,15 @@ def setup_logging(save_dir: str) -> logging.Logger:
 MODALITIES = ["flair", "t1", "t1ce", "t2"]
 SEG_FILE   = "seg"
 
+# Native BraTS2020 volume geometry: 240 x 240 x 155 spatial, 4 MRI modalities.
+FULL_GEOMETRY = (240, 240, 155)
+
+# Every 3-D U-Net in this file down-samples four times (MaxPool3d(2)), so any
+# spatial dimension fed to a model must be divisible by 2**4 = 16.  Crops are
+# therefore padded up to the next multiple of this value — e.g. the native
+# depth 155 is padded to 160 so full-geometry volumes pass through the models.
+PATCH_STRIDE_MULTIPLE = 16
+
 
 def find_patient_dirs(data_dir: str) -> List[Path]:
     """
@@ -168,16 +184,78 @@ def normalise_volume(vol: np.ndarray) -> np.ndarray:
 
 def build_label_map(seg: np.ndarray) -> np.ndarray:
     """
-    BraTS label convention → 3-channel binary map [WT, TC, ET].
-    WT = labels {1,2,4}
-    TC = labels {1,4}
-    ET = label  {4}
-    Returns shape (3, H, W, D) float32.
+    BraTS labels -> a single mutually-exclusive integer class map.
+
+    Remapping (labels are not contiguous in BraTS: there is no label 3):
+        0 -> 0  background
+        1 -> 1  NCR / NET   (necrotic & non-enhancing tumour core)
+        2 -> 2  ED          (peritumoural oedema)
+        4 -> 3  ET          (enhancing tumour)
+    Some pre-processed copies already store ET as 3, so 3 is also mapped to ET.
+
+    Returns shape (1, H, W, D) float32 holding class indices {0,1,2,3}.  A
+    singleton channel is kept so the crop / flip / slice code (which is
+    channel-first) works unchanged; padding with 0 is background, as desired.
     """
-    wt = (seg > 0).astype(np.float32)
-    tc = ((seg == 1) | (seg == 4)).astype(np.float32)
-    et = (seg == 4).astype(np.float32)
-    return np.stack([wt, tc, et], axis=0)  # (3, H, W, D)
+    cls = np.zeros(seg.shape, dtype=np.float32)
+    cls[seg == 1] = 1
+    cls[seg == 2] = 2
+    cls[(seg == 4) | (seg == 3)] = 3
+    return cls[None]  # (1, H, W, D)
+
+
+def build_augmentation(
+    is_2d:          bool  = False,
+    flip_prob:      float = 0.5,
+    affine_prob:    float = 0.3,
+    elastic_prob:   float = 0.2,
+    noise_prob:     float = 0.2,
+    intensity_prob: float = 0.3,
+):
+    """
+    Build a TorchIO augmentation pipeline shared by the 3-D and 2-D datasets.
+
+    TorchIO applies each spatial transform consistently to the MRI (linear
+    interpolation) and to the segmentation (nearest-neighbour, so class indices
+    stay valid), and applies intensity transforms to the MRI only.
+
+    Included: random flips, random affine (rotation + geometric scaling),
+    random elastic deformation (3-D only), smooth intensity inhomogeneity
+    (bias field) and additive Gaussian noise.
+    """
+    if tio is None:
+        raise ImportError(
+            "TorchIO is required for data augmentation: `pip install torchio` "
+            "(or pass --no_augment to disable augmentation)."
+        )
+
+    axes    = (0, 1) if is_2d else (0, 1, 2)
+    # For 2-D (a singleton depth axis) rotate only in-plane, about the last axis.
+    degrees = (0, 0, 0, 0, -10, 10) if is_2d else 10
+
+    transforms = [
+        tio.RandomFlip(axes=axes, flip_probability=flip_prob),
+        tio.RandomAffine(                                   # rotation + geometric scaling
+            scales=(0.9, 1.1),
+            degrees=degrees,
+            image_interpolation="linear",
+            default_pad_value=0,
+            p=affine_prob,
+        ),
+    ]
+    if not is_2d:
+        transforms.append(
+            tio.RandomElasticDeformation(                   # elastic deformation
+                num_control_points=7,
+                max_displacement=7.0,
+                p=elastic_prob,
+            )
+        )
+    transforms += [
+        tio.RandomBiasField(coefficients=0.3, p=intensity_prob),   # intensity inhomogeneity
+        tio.RandomNoise(mean=0.0, std=(0.0, 0.1), p=noise_prob),    # additive Gaussian noise
+    ]
+    return tio.Compose(transforms)
 
 
 class BraTS2020Dataset(Dataset):
@@ -185,26 +263,36 @@ class BraTS2020Dataset(Dataset):
     Unified dataset compatible with all five repo conventions.
     Returns:
         image  – (4, H, W, D) float32 tensor
-        label  – (3, H, W, D) float32 tensor  [WT, TC, ET]
+        label  – (1, H, W, D) float32 tensor of integer class indices {0,1,2,3}
         pid    – patient folder name string
     """
 
     def __init__(
         self,
         patient_dirs: List[Path],
-        patch_size: Tuple[int, int, int] = (128, 128, 128),
+        patch_size: Tuple[int, int, int] = FULL_GEOMETRY,
         augment: bool = False,
         flip_prob: float = 0.5,
-        rotate_prob: float = 0.3,
+        affine_prob: float = 0.3,
+        elastic_prob: float = 0.2,
+        noise_prob: float = 0.2,
         intensity_prob: float = 0.3,
         cache_rate: float = 0.0,
+        pad_multiple: int = PATCH_STRIDE_MULTIPLE,
     ):
         self.patients    = patient_dirs
         self.patch_size  = patch_size
         self.augment     = augment
-        self.flip_prob   = flip_prob
-        self.rotate_prob = rotate_prob
-        self.intensity_prob = intensity_prob
+        self.pad_multiple   = pad_multiple
+        # TorchIO augmentation pipeline (built lazily only when needed).
+        self.transform = (
+            build_augmentation(
+                is_2d=False, flip_prob=flip_prob, affine_prob=affine_prob,
+                elastic_prob=elastic_prob, noise_prob=noise_prob,
+                intensity_prob=intensity_prob,
+            )
+            if augment else None
+        )
         self._cache: Dict[int, tuple] = {}
         self._cache_limit = int(len(patient_dirs) * cache_rate)
 
@@ -229,7 +317,7 @@ class BraTS2020Dataset(Dataset):
         # ---------- load segmentation ----------
         seg_candidates = sorted(pdir.glob(f"*_seg.nii*"))
         if not seg_candidates:
-            label = np.zeros((3,) + image.shape[1:], dtype=np.float32)
+            label = np.zeros((1,) + image.shape[1:], dtype=np.float32)   # all background
         else:
             seg   = load_nii(seg_candidates[0])
             label = build_label_map(seg)
@@ -239,59 +327,87 @@ class BraTS2020Dataset(Dataset):
             self._cache[idx] = result
         return result
 
-    def _random_crop(self, image: np.ndarray, label: np.ndarray):
+    @staticmethod
+    def _round_up(value: int, multiple: int) -> int:
+        """Smallest multiple of ``multiple`` that is >= ``value`` (identity if multiple <= 1)."""
+        if multiple <= 1:
+            return int(value)
+        return int(np.ceil(value / multiple) * multiple)
+
+    def _foreground_biased_crop(self, image: np.ndarray, label: np.ndarray):
+        """
+        Foreground-biased patch extraction.
+
+        A crop of size ``self.patch_size`` (H, W, D) is taken from the full
+        volume and is *centred on a randomly chosen foreground voxel* — a random
+        voxel belonging to any tumour class (class index > 0).  When a volume
+        contains no foreground the crop location falls back to a uniform-random position.
+
+        With ``patch_size`` at the full native geometry (240, 240, 155) the crop
+        spans the whole brain; with a smaller ``patch_size`` it yields
+        tumour-centred sub-volumes.
+
+        Finally the tensors are zero-padded (trailing side) so every spatial
+        dimension is a multiple of ``self.pad_multiple`` (default 16).  The 3-D
+        U-Nets here down-sample four times, so their input must be divisible by
+        16 — e.g. the native depth 155 is padded to 160.  Padding to a fixed
+        target also keeps every sample the same shape, which batching requires.
+        """
         ph, pw, pd = self.patch_size
-        _, h, w, d  = image.shape
+        _, h, w, d = image.shape
+
+        # Largest valid top-left corner that keeps the crop inside the volume.
         sh = max(0, h - ph)
         sw = max(0, w - pw)
         sd = max(0, d - pd)
 
-        # Bias towards foreground
-        fg = np.argwhere(label.sum(0) > 0)
+        fg = np.argwhere(label.sum(0) > 0)              # foreground voxel coords (N, 3)
         if len(fg) > 0:
-            center = fg[np.random.randint(len(fg))]
-            x = int(np.clip(center[0] - ph // 2, 0, sh))
-            y = int(np.clip(center[1] - pw // 2, 0, sw))
-            z = int(np.clip(center[2] - pd // 2, 0, sd))
+            centre = fg[np.random.randint(len(fg))]      # pick one foreground voxel …
+            x = int(np.clip(centre[0] - ph // 2, 0, sh)) # … and centre the crop on it,
+            y = int(np.clip(centre[1] - pw // 2, 0, sw)) #     clipped to stay in-bounds
+            z = int(np.clip(centre[2] - pd // 2, 0, sd))
         else:
             x = np.random.randint(0, sh + 1)
             y = np.random.randint(0, sw + 1)
             z = np.random.randint(0, sd + 1)
 
-        image = image[:, x:x+ph, y:y+pw, z:z+pd]
-        label = label[:, x:x+ph, y:y+pw, z:z+pd]
+        image = image[:, x:x + ph, y:y + pw, z:z + pd]
+        label = label[:, x:x + ph, y:y + pw, z:z + pd]
 
-        # Pad if volume smaller than patch
-        def pad_to(arr, target):
-            pads = [(0, 0)] + [(0, max(0, t - s)) for t, s in zip(target, arr.shape[1:])]
+        # Pad each spatial dim up to the next network-friendly multiple.
+        target = tuple(self._round_up(p, self.pad_multiple) for p in self.patch_size)
+
+        def pad_to(arr, tgt_spatial):
+            pads = [(0, 0)] + [(0, max(0, t - s))
+                               for t, s in zip(tgt_spatial, arr.shape[1:])]
             return np.pad(arr, pads)
 
-        image = pad_to(image, (4,) + self.patch_size)
-        label = pad_to(label, (3,) + self.patch_size)
+        image = pad_to(image, target)
+        label = pad_to(label, target)
         return image, label
 
-    def _augment(self, image: np.ndarray, label: np.ndarray):
-        # Random flip
-        for axis in [1, 2, 3]:
-            if np.random.rand() < self.flip_prob:
-                image = np.flip(image, axis=axis).copy()
-                label = np.flip(label, axis=axis).copy()
-        # Random intensity shift / scale (per modality)
-        if np.random.rand() < self.intensity_prob:
-            for c in range(image.shape[0]):
-                shift = np.random.uniform(-0.1, 0.1)
-                scale = np.random.uniform(0.9, 1.1)
-                image[c] = image[c] * scale + shift
+    def _apply_transform(self, image: np.ndarray, label: np.ndarray):
+        """Run the TorchIO pipeline on one (image, label) pair (both channel-first)."""
+        subject = tio.Subject(
+            image=tio.ScalarImage(
+                tensor=torch.as_tensor(np.ascontiguousarray(image), dtype=torch.float32)),
+            label=tio.LabelMap(
+                tensor=torch.as_tensor(np.ascontiguousarray(label), dtype=torch.int16)),
+        )
+        subject = self.transform(subject)
+        image = subject.image.tensor.numpy()
+        label = subject.label.tensor.numpy().astype(np.float32)   # class indices preserved
         return image, label
 
     def __getitem__(self, idx: int):
         image, label, pid = self._load(idx)
-        image, label = self._random_crop(image, label)
-        if self.augment:
-            image, label = self._augment(image, label)
+        image, label = self._foreground_biased_crop(image, label)
+        if self.augment and self.transform is not None:
+            image, label = self._apply_transform(image, label)
         return (
-            torch.from_numpy(image.copy()).float(),
-            torch.from_numpy(label.copy()).float(),
+            torch.from_numpy(np.ascontiguousarray(image)).float(),
+            torch.from_numpy(np.ascontiguousarray(label)).float(),   # (1,H,W,D) class indices
             pid,
         )
 
@@ -357,39 +473,82 @@ def make_cv_splits(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DiceLoss(nn.Module):
-    """Soft Dice loss averaged over channels."""
-    def __init__(self, smooth: float = 1e-5):
+    """
+    Multi-class soft Dice on softmax probabilities, averaged over the foreground
+    classes (background excluded by default).
+
+    Accepts raw logits of shape (B, C, *spatial) and an integer target of shape
+    (B, *spatial) or (B, 1, *spatial).
+    """
+    def __init__(self, smooth: float = 1e-5, ignore_background: bool = True):
         super().__init__()
         self.smooth = smooth
+        self.ignore_background = ignore_background
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred   = torch.sigmoid(pred)
-        pred   = pred.flatten(2)   # (B, C, N)
-        target = target.flatten(2)
-        num    = 2 * (pred * target).sum(-1) + self.smooth
-        den    = pred.sum(-1) + target.sum(-1) + self.smooth
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        num_classes = logits.shape[1]
+        target = target.long()
+        if target.dim() == logits.dim():          # (B, 1, *spatial) -> (B, *spatial)
+            target = target.squeeze(1)
+
+        probs   = torch.softmax(logits, dim=1)                       # (B, C, *spatial)
+        true_1h = F.one_hot(target, num_classes).movedim(-1, 1).float()  # (B, C, *spatial)
+
+        probs   = probs.flatten(2)      # (B, C, N)
+        true_1h = true_1h.flatten(2)
+        if self.ignore_background:
+            probs   = probs[:, 1:]
+            true_1h = true_1h[:, 1:]
+
+        num = 2 * (probs * true_1h).sum(-1) + self.smooth
+        den = probs.sum(-1) + true_1h.sum(-1) + self.smooth
         return (1 - num / den).mean()
 
 
 class CombinedLoss(nn.Module):
-    """Dice + BCE (weighted)."""
-    def __init__(self, dice_w: float = 0.6, bce_w: float = 0.4):
-        super().__init__()
-        self.dice  = DiceLoss()
-        self.bce_w = bce_w
-        self.dice_w = dice_w
+    """
+    Combined multi-class loss: a * Dice + (1 - a) * categorical cross-entropy.
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        dice_loss = self.dice(pred, target)
-        bce_loss  = F.binary_cross_entropy_with_logits(pred, target)
-        return self.dice_w * dice_loss + self.bce_w * bce_loss
+    Cross-entropy is computed with ``nn.CrossEntropyLoss`` (log-softmax applied
+    internally), so this is categorical CE with softmax over the class channel.
+    """
+    def __init__(self, alpha: float = 0.5):
+        super().__init__()
+        self.alpha = alpha              # a = 0.5
+        self.dice  = DiceLoss()
+        self.ce    = nn.CrossEntropyLoss()
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target = target.long()
+        target_idx = target.squeeze(1) if target.dim() == logits.dim() else target
+        ce_loss   = self.ce(logits, target_idx)     # softmax categorical cross-entropy
+        dice_loss = self.dice(logits, target_idx)
+        return self.alpha * dice_loss + (1 - self.alpha) * ce_loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METRICS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Multi-class label convention (mutually exclusive), remapped from BraTS:
+#   0 = background, 1 = NCR/NET, 2 = ED (oedema), 3 = ET (enhancing tumour)
+NUM_CLASSES  = 4
 REGION_NAMES = ["WT", "TC", "ET"]
+
+
+def region_masks(cls_map: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    Reconstruct the standard overlapping BraTS regions from a class-index map.
+        WT (whole tumour) = classes {1, 2, 3}
+        TC (tumour core)  = classes {1, 3}
+        ET (enhancing)    = class   {3}
+    Returns a dict of boolean masks.
+    """
+    return {
+        "WT": cls_map > 0,
+        "TC": (cls_map == 1) | (cls_map == 3),
+        "ET": cls_map == 3,
+    }
 
 
 def dice_score(pred: np.ndarray, target: np.ndarray, smooth: float = 1e-5) -> float:
@@ -413,19 +572,29 @@ def hausdorff95(pred: np.ndarray, target: np.ndarray) -> float:
         return float("nan")
 
 
-def evaluate_batch(preds: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
+def evaluate_batch(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
     """
-    Works for both 2-D slices  (B, 3, H, W)
-    and         3-D volumes    (B, 3, H, W, D).
-    Returns mean Dice per region.
+    Multi-class evaluation. Takes raw logits (B, C, *spatial) and an integer
+    target (B, *spatial) or (B, 1, *spatial); reduces both to class maps and
+    reports mean Dice for the WT / TC / ET regions.
+
+    Works for both 2-D slices (spatial = H, W) and 3-D volumes (H, W, D).
     """
-    preds   = (preds.detach().cpu().float() > 0.5).numpy()
-    targets = targets.detach().cpu().float().numpy()
-    results = {}
-    for ci, name in enumerate(REGION_NAMES):
-        scores = [dice_score(preds[b, ci], targets[b, ci])
-                  for b in range(preds.shape[0])]
-        results[f"dice_{name}"] = float(np.mean(scores))
+    pred_cls = logits.detach().argmax(dim=1).cpu().numpy()   # (B, *spatial)
+    tgt      = targets.detach().cpu().numpy()
+    if tgt.ndim == pred_cls.ndim + 1:                        # (B, 1, *spatial) -> (B, *spatial)
+        tgt = tgt[:, 0]
+    tgt = tgt.astype(np.int64)
+
+    per: Dict[str, List[float]] = {n: [] for n in REGION_NAMES}
+    for b in range(pred_cls.shape[0]):
+        pr = region_masks(pred_cls[b])
+        gt = region_masks(tgt[b])
+        for name in REGION_NAMES:
+            per[name].append(dice_score(pr[name].astype(np.float32),
+                                        gt[name].astype(np.float32)))
+
+    results = {f"dice_{n}": float(np.mean(per[n])) for n in REGION_NAMES}
     results["dice_mean"] = float(np.mean([results[f"dice_{n}"] for n in REGION_NAMES]))
     return results
 
@@ -883,7 +1052,7 @@ class UNet2D(nn.Module):
     Classic 2-D U-Net (Ronneberger et al., 2015).
 
     Operates on individual axial slices: input  (B, 4, H, W)
-                                         output (B, 3, H, W)
+                                         output (B, num_classes, H, W)
 
     Encoder depth: 4 levels with MaxPool2d(2).
     Decoder uses bilinear upsampling (no checkerboard artefacts) followed
@@ -939,7 +1108,7 @@ class UNet2D(nn.Module):
         d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.head(d1)          # (B, 3, H, W)
+        return self.head(d1)          # (B, num_classes, H, W)
 
 
 # ── 2-D Slice Dataset ─────────────────────────────────────────────────────────
@@ -951,16 +1120,18 @@ class BraTS2020SliceDataset(Dataset):
 
     Returns:
         image  – (4, H, W) float32  (one axial slice, all modalities)
-        label  – (3, H, W) float32  (WT / TC / ET for that slice)
+        label  – (1, H, W) float32  (integer class indices {0,1,2,3})
         pid    – "<patient_id>_z<slice_index>" string
     """
 
     def __init__(
         self,
         patient_dirs: List[Path],
-        patch_size: Tuple[int, int, int] = (128, 128, 128),
+        patch_size: Tuple[int, int, int] = FULL_GEOMETRY,
         augment: bool = False,
         flip_prob: float = 0.5,
+        affine_prob: float = 0.3,
+        noise_prob: float = 0.2,
         intensity_prob: float = 0.3,
         skip_empty_ratio: float = 0.9,
         cache_rate: float = 0.0,
@@ -969,20 +1140,26 @@ class BraTS2020SliceDataset(Dataset):
         skip_empty_ratio: fraction of all-background slices to randomly drop
                           during dataset construction (keeps training balanced).
         """
-        # Reuse 3-D loader for I/O and normalisation
+        # Reuse 3-D loader for I/O and normalisation (no augmentation at volume level)
         self._vol_ds = BraTS2020Dataset(
             patient_dirs, patch_size, augment=False, cache_rate=cache_rate
         )
         self.augment          = augment
-        self.flip_prob        = flip_prob
-        self.intensity_prob   = intensity_prob
         self.skip_empty_ratio = skip_empty_ratio
+        # 2-D TorchIO pipeline (elastic deformation is skipped in 2-D).
+        self.transform = (
+            build_augmentation(
+                is_2d=True, flip_prob=flip_prob, affine_prob=affine_prob,
+                noise_prob=noise_prob, intensity_prob=intensity_prob,
+            )
+            if augment else None
+        )
 
         # Build index: list of (vol_idx, slice_z)
         self._index: List[Tuple[int, int]] = []
         rng = np.random.default_rng(0)
         for vi in range(len(self._vol_ds)):
-            _, label, _ = self._vol_ds[vi]          # (3, H, W, D)
+            _, label, _ = self._vol_ds[vi]          # (1, H, W, D) class map
             D = label.shape[-1]
             for z in range(D):
                 has_fg = label[:, :, :, z].sum() > 0
@@ -993,29 +1170,34 @@ class BraTS2020SliceDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
+    def _apply_transform(self, img_sl: np.ndarray, lbl_sl: np.ndarray):
+        """Apply the 2-D TorchIO pipeline by adding a singleton depth axis."""
+        subject = tio.Subject(
+            image=tio.ScalarImage(
+                tensor=torch.as_tensor(np.ascontiguousarray(img_sl[..., None]),
+                                       dtype=torch.float32)),
+            label=tio.LabelMap(
+                tensor=torch.as_tensor(np.ascontiguousarray(lbl_sl[..., None]),
+                                       dtype=torch.int16)),
+        )
+        subject = self.transform(subject)
+        img_sl = subject.image.tensor.numpy()[..., 0]
+        lbl_sl = subject.label.tensor.numpy()[..., 0].astype(np.float32)
+        return img_sl, lbl_sl
+
     def __getitem__(self, idx: int):
         vi, z = self._index[idx]
-        image, label, pid = self._vol_ds[vi]          # (4,H,W,D), (3,H,W,D)
+        image, label, pid = self._vol_ds[vi]          # (4,H,W,D), (1,H,W,D)
 
         img_sl  = image[:, :, :, z].numpy()           # (4, H, W)
-        lbl_sl  = label[:, :, :, z].numpy()           # (3, H, W)
+        lbl_sl  = label[:, :, :, z].numpy()           # (1, H, W) class indices
 
-        # ── 2-D augmentation ─────────────────────────────────────────────────
-        if self.augment:
-            # Random horizontal/vertical flip
-            for axis in [1, 2]:
-                if np.random.rand() < self.flip_prob:
-                    img_sl = np.flip(img_sl, axis=axis).copy()
-                    lbl_sl = np.flip(lbl_sl, axis=axis).copy()
-            # Random intensity shift / scale per modality
-            if np.random.rand() < self.intensity_prob:
-                for c in range(img_sl.shape[0]):
-                    img_sl[c] = img_sl[c] * np.random.uniform(0.9, 1.1) \
-                                           + np.random.uniform(-0.1, 0.1)
+        if self.augment and self.transform is not None:
+            img_sl, lbl_sl = self._apply_transform(img_sl, lbl_sl)
 
         return (
-            torch.from_numpy(img_sl.copy()).float(),
-            torch.from_numpy(lbl_sl.copy()).float(),
+            torch.from_numpy(np.ascontiguousarray(img_sl)).float(),
+            torch.from_numpy(np.ascontiguousarray(lbl_sl)).float(),
             f"{pid}_z{z:03d}",
         )
 
@@ -1040,7 +1222,7 @@ def build_model(cfg: dict) -> nn.Module:
         raise ValueError(f"Unknown model '{name}'. Available: {list(MODEL_REGISTRY)}")
     kwargs = dict(
         in_channels=cfg["in_channels"],
-        out_channels=cfg["num_classes"] - 1,  # 3 binary maps
+        out_channels=cfg["num_classes"],       # one logit per class (incl. background) for softmax
         base_filters=cfg["base_filters"],
     )
     if name == "diff_unet":
@@ -1090,7 +1272,8 @@ class Trainer:
             logger.info("2-D mode: building per-slice datasets (axial slices)")
             self.train_ds = BraTS2020SliceDataset(
                 train_pts, cfg["patch_size"], augment=cfg["augment"],
-                flip_prob=cfg["flip_prob"], intensity_prob=cfg["intensity_prob"],
+                flip_prob=cfg["flip_prob"], affine_prob=cfg["affine_prob"],
+                noise_prob=cfg["noise_prob"], intensity_prob=cfg["intensity_prob"],
                 cache_rate=cfg["cache_rate"],
             )
             self.val_ds = BraTS2020SliceDataset(
@@ -1102,7 +1285,8 @@ class Trainer:
         else:
             self.train_ds = BraTS2020Dataset(
                 train_pts, cfg["patch_size"], augment=cfg["augment"],
-                flip_prob=cfg["flip_prob"], rotate_prob=cfg["rotate_prob"],
+                flip_prob=cfg["flip_prob"], affine_prob=cfg["affine_prob"],
+                elastic_prob=cfg["elastic_prob"], noise_prob=cfg["noise_prob"],
                 intensity_prob=cfg["intensity_prob"], cache_rate=cfg["cache_rate"],
             )
             self.val_ds = BraTS2020Dataset(
@@ -1161,7 +1345,11 @@ class Trainer:
         self.opt.zero_grad()
         with autocast(enabled=self.cfg["amp"]):
             if isinstance(self.model, DiffUNet):
-                pred_noise, true_noise = self.model(image, label)
+                # Diff-UNet diffuses the segmentation itself: feed a one-hot
+                # (B, C, H, W, D) float target derived from the class map.
+                seg = F.one_hot(label.long().squeeze(1),
+                                self.cfg["num_classes"]).permute(0, 4, 1, 2, 3).float()
+                pred_noise, true_noise = self.model(image, seg)
                 loss = F.mse_loss(pred_noise, true_noise)
             else:
                 pred = self.model(image)
@@ -1192,7 +1380,7 @@ class Trainer:
                     loss = self.criterion(pred, label)
 
             all_metrics["loss"].append(loss.item())
-            batch_m = evaluate_batch(torch.sigmoid(pred), label)
+            batch_m = evaluate_batch(pred, label)
             for k, v in batch_m.items():
                 if k.startswith("dice_") and k in all_metrics:
                     all_metrics[k].append(v)
@@ -1344,13 +1532,16 @@ class Evaluator:
                     pred = self.model(image)
                 else:
                     pred = self.model(image)
-            pred_bin = (torch.sigmoid(pred).cpu().numpy() > 0.5)[0]  # (3,H,W,D)
-            label_np = label.numpy()[0]                               # (3,H,W,D)
+            pred_cls  = pred.argmax(1).cpu().numpy()[0]      # (H, W, D) predicted classes
+            label_cls = label.cpu().numpy()[0, 0]            # (H, W, D) ground-truth classes
+            pred_r    = region_masks(pred_cls)
+            label_r   = region_masks(label_cls)
 
             row = {"patient": pid[0]}
-            for ci, name in enumerate(REGION_NAMES):
-                d = dice_score(pred_bin[ci], label_np[ci])
-                h = hausdorff95(pred_bin[ci], label_np[ci])
+            for name in REGION_NAMES:
+                d = dice_score(pred_r[name].astype(np.float32),
+                               label_r[name].astype(np.float32))
+                h = hausdorff95(pred_r[name], label_r[name])
                 row[f"dice_{name}"] = round(d, 4)
                 row[f"hd95_{name}"] = round(h, 4)
                 agg[f"dice_{name}"].append(d)
@@ -1468,17 +1659,22 @@ class CrossValidationRunner:
                 with autocast():
                     pred = model(image) if not isinstance(model, DiffUNet) \
                            else model(image)
-                pred_bin = (torch.sigmoid(pred).cpu().float() > 0.5).numpy()
-                label_np = label.float().numpy()
+                pred_cls  = pred.argmax(1).cpu().numpy()        # (B, *spatial)
+                label_cls = label.cpu().numpy()
+                if label_cls.ndim == pred_cls.ndim + 1:         # (B,1,*spatial) -> (B,*spatial)
+                    label_cls = label_cls[:, 0]
 
                 for b, raw_pid in enumerate(pids):
                     # For 2-D: strip the _z### suffix to group by patient
                     pid = raw_pid.rsplit("_z", 1)[0] if is_2d_model(self.cfg) else raw_pid
                     if pid not in patient_scores:
                         patient_scores[pid] = {n: [] for n in REGION_NAMES}
-                    for ci, name in enumerate(REGION_NAMES):
+                    pred_r  = region_masks(pred_cls[b])
+                    label_r = region_masks(label_cls[b])
+                    for name in REGION_NAMES:
                         patient_scores[pid][name].append(
-                            dice_score(pred_bin[b, ci], label_np[b, ci])
+                            dice_score(pred_r[name].astype(np.float32),
+                                       label_r[name].astype(np.float32))
                         )
 
         rows = []
@@ -1541,7 +1737,7 @@ class CrossValidationRunner:
                         img = img.to(device)
                         with autocast():
                             out = model(img)
-                        m = evaluate_batch(torch.sigmoid(out), lbl)
+                        m = evaluate_batch(out, lbl)
                         for name in REGION_NAMES:
                             per_region[name].append(m[f"dice_{name}"])
                 for name in REGION_NAMES:
@@ -1657,7 +1853,11 @@ def parse_args():
     p.add_argument("--data_dir",   default=None, help="Root of BraTS2020 dataset")
     p.add_argument("--val_ratio",  type=float, default=None)
     p.add_argument("--patch_size", type=int, nargs=3, default=None,
-                   metavar=("H","W","D"))
+                   metavar=("H", "W", "D"),
+                   help="Model input crop size H W D. Default: full BraTS "
+                        "geometry 240 240 155. Each dim is padded up to a "
+                        "multiple of 16 for the 3-D U-Nets (e.g. 155 -> 160). "
+                        "A smaller size yields tumour-centred sub-volumes.")
     p.add_argument("--num_workers",type=int, default=None)
     p.add_argument("--cache_rate", type=float, default=None)
 
