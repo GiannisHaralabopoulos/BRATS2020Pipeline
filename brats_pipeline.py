@@ -78,7 +78,7 @@ DEFAULT_CFG = {
     # Training
     "mode":            "train",
     "epochs":          300,
-    "batch_size":      1,
+    "batch_size":      4,
     "lr":              1e-4,
     "weight_decay":    1e-5,
     "scheduler":       "cosine",      # cosine | plateau | none
