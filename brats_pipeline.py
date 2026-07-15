@@ -83,7 +83,7 @@ DEFAULT_CFG = {
     "weight_decay":    1e-5,
     "scheduler":       "cosine",      # cosine | plateau | none
     "amp":             True,
-    "seed":            42,
+    "seed":            123,
     "checkpoint":      None,          # path to resume from
     "save_dir":        "./runs",
     "log_interval":    10,            # steps between console/tb logs
