@@ -1,6 +1,6 @@
 # BraTS2020 Unified Segmentation Pipeline
 
-**Python script:** `brats_pipeline_5090_autobatch_minimum_lock.py`  
+**Python script:** `brats_pipeline.py`  
 **SHA-256:** `193c594f254d5cdfc1035acb03017138b808b45014ec29ffcd6a002e0761c1f7`
 
 ## Overview
@@ -652,7 +652,7 @@ tensorboard
 ### Interactive training
 
 ```bash
-python brats_pipeline_5090_autobatch_minimum_lock.py --data_dir /path/to/BraTS2020
+python brats_pipeline_5090.py --data_dir /path/to/BraTS2020
 ```
 
 The script presents the seven-model selection menu.
@@ -660,13 +660,13 @@ The script presents the seven-model selection menu.
 ### List models
 
 ```bash
-python brats_pipeline_5090_autobatch_minimum_lock.py --list_models
+python brats_pipeline_5090.py --list_models
 ```
 
 ### Scripted model selection
 
 ```bash
-python brats_pipeline_5090_autobatch_minimum_lock.py \
+python brats_pipeline_5090.py \
     --model unet2d \
     --data_dir /path/to/BraTS2020
 ```
@@ -676,7 +676,7 @@ Depending on the current prompt-first CLI settings, the explicit no-prompt optio
 ### Evaluate a checkpoint
 
 ```bash
-python brats_pipeline_5090_autobatch_minimum_lock.py \
+python brats_pipeline_5090.py \
     --mode eval \
     --model diff_unet \
     --checkpoint /path/to/best.pth \
