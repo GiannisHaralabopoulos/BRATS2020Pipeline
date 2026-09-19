@@ -1,442 +1,625 @@
-# BraTS2020 Unified Segmentation Pipeline
+# Unified BraTS2020 Brain Tumour Segmentation Pipeline
 
-**Python script:** `brats_pipeline.py`  
-**SHA-256:** `193c594f254d5cdfc1035acb03017138b808b45014ec29ffcd6a002e0761c1f7`
+A unified PyTorch pipeline for training, validating, testing, and benchmarking seven brain tumour segmentation architectures on the labelled BraTS2020 cohort.
 
-## Overview
+The pipeline was designed for controlled architecture comparison. It uses a fixed patient-level split, a common multi-class loss, shared GPU augmentation, consistent early stopping, and the same final evaluation procedure across models, while retaining architecture-specific requirements such as 2D versus 3D inputs, internal resizing, iterative diffusion inference, and ensemble test-time augmentation.
 
-This script implements a unified PyTorch pipeline for training and evaluating seven 2D and 3D brain tumour segmentation architectures on the labelled BraTS 2020 training cohort.
+> The uploaded source file is named `brats_pipeline(3).py`. The examples below use the cleaner repository name `brats_pipeline.py`. Rename the file or substitute the uploaded filename in the commands.
 
-The default experimental design uses a single fixed patient-level 80/10/10 split of the 369 labelled BraTS 2020 subjects:
+## Main features
 
-- 80% training, approximately 295 patients
-- 10% validation, approximately 37 patients
-- 10% final held-out testing, approximately 37 patients
-
-The split is saved to `runs/fixed_split.json` and reused across architectures so that every model is trained, validated and tested on the same subjects. The official BraTS 2020 validation cohort is not used because ground-truth segmentation labels are unavailable.
-
-The pipeline is designed for CUDA training and has been optimised for a 32 GB NVIDIA RTX 5090 and a 64 GB RAM Windows workstation.
-
----
+- Seven 2D and 3D segmentation architectures in one training pipeline
+- Fixed patient-level 80% training, 10% validation, and 10% final test split
+- Reuses the same saved split across architectures
+- Four-class softmax segmentation with background, NCR/NET, oedema, and enhancing tumour
+- Combined loss with 0.5 foreground Dice loss and 0.5 categorical cross-entropy
+- Patient-level Dice and HD95 for whole tumour, tumour core, and enhancing tumour
+- Native PyTorch GPU augmentation
+- Automatic VRAM-aware batch-size tuning
+- Mixed-precision training
+- Memory-mapped preprocessing cache
+- Full patient-level computational benchmarking
+- Early stopping and best-checkpoint selection
+- Patient-level CSV outputs suitable for paired statistical comparisons
+- Optional legacy k-fold cross-validation mode
+- Windows and RTX 5090-oriented memory and worker safeguards
 
 ## Models
 
-The interactive model menu is ordered by dimensionality and trainable parameter count.
+| CLI name | Architecture | Dimensionality | Approx. trainable parameters | Key implementation details |
+| --- | --- | ---: | ---: | --- |
+| `unet2d` | U-Net 2D | 2D | 7.76 M | Four pooling stages, GroupNorm, transposed-convolution decoder |
+| `hvu` | HVU / DenseVU-ED | 2D | 36.51 M | U-Net + DenseNet121 feature branch + Vision Transformer branch |
+| `deeplabv3plus2d` | DeepLabV3+ | 2D | 40.35 M | ResNet-50 style encoder, ASPP, output stride 16 |
+| `diff_unet` | Diff-UNet | 3D | 10.05 M | Separate MRI encoder, START_X diffusion training, 50-step DDIM-style inference |
+| `hybridattunet` | HybridAttUNet | 3D | 14.10 M | Residual attention modules and squeeze-excitation decoder |
+| `unet3d` | U-Net 3D | 3D | 22.58 M | Conventional volumetric U-Net |
+| `deepensemble` | DeepEnsembled U-Net | 3D | 115.78 M total | Five independently trained Henry-style members, deep supervision, 16-way TTA |
 
-### 2D models
+The DeepEnsembled U-Net trains its five members sequentially. Peak training VRAM therefore reflects the largest individual member rather than all five models resident simultaneously.
 
-1. **UNet 2D**, approximately 7.85 M trainable parameters
-2. **HVU 2D DenseVU-ED**, approximately 36.51 M trainable parameters
-3. **DeepLabV3+ 2D**, approximately 40.35 M trainable parameters
+## Dataset
 
-### 3D models
+The default experiment uses only the labelled BraTS2020 training cohort. The official BraTS2020 validation cohort is not used because it does not contain ground-truth segmentation masks.
 
-4. **Diff-UNet 3D**, approximately 10.99 M trainable parameters
-5. **HybridAttUnet 3D**, approximately 14.10 M trainable parameters
-6. **UNet 3D**, approximately 22.58 M trainable parameters
-7. **DeepEnsemble 3D**, approximately 34.71 M trainable parameters
-
-The internal model keys are:
-
-```text
-unet2d
-hvu
-deeplabv3plus2d
-diff_unet
-hybridattunet
-unet3d
-deepensemble
-```
-
----
-
-## BraTS 2020 Inputs
-
-The script expects patient directories containing the four MRI modalities:
+Each patient directory must contain the four MRI modalities and a segmentation mask:
 
 ```text
-*_flair.nii.gz
-*_t1.nii.gz
-*_t1ce.nii.gz
-*_t2.nii.gz
+BraTS2020/
+└── BraTS20_Training_001/
+    ├── BraTS20_Training_001_flair.nii.gz
+    ├── BraTS20_Training_001_t1.nii.gz
+    ├── BraTS20_Training_001_t1ce.nii.gz
+    ├── BraTS20_Training_001_t2.nii.gz
+    └── BraTS20_Training_001_seg.nii.gz
 ```
 
-and a segmentation mask.
+The pipeline searches recursively for patient folders containing `*_flair.nii*`. If `--data_dir` points to a parent directory containing both training and validation data, the labelled training cohort is auto-detected where possible. You can avoid ambiguity by supplying `--train_data_dir` explicitly.
 
-The four MRI channels are:
+### MRI preprocessing
+
+The four input modalities are:
 
 1. FLAIR
 2. T1
 3. T1ce
 4. T2
 
-### Native geometry
+Each modality is independently z-score normalised over non-zero voxels. Background voxels remain zero.
 
-BraTS 2020 volumes use the native spatial geometry:
+Native BraTS2020 spatial geometry is:
 
 ```text
 240 x 240 x 155
 ```
 
-with four MRI modalities.
-
-### 2D inputs
-
-The 2D models operate on individual axial slices:
-
-```text
-4 x 240 x 240
-```
-
-The common data input therefore corresponds to `240 x 240 x 4` when written with channels last.
-
-The HVU DenseVU-ED model internally resizes each slice to `256 x 256` for its forward pass and returns its output to `240 x 240`.
-
-### 3D inputs
-
-The native depth of 155 is padded to 160 before the 3D networks are applied, giving a model-ready tensor equivalent to:
+For 3D models, the depth is padded to 160 so that all spatial dimensions are compatible with four downsampling stages:
 
 ```text
 4 x 240 x 240 x 160
 ```
 
-or `240 x 240 x 160 x 4` when written with modalities last.
+The default experiment uses the full native field of view rather than spatial cropping.
 
-No spatial cropping is applied to the full-volume 3D inputs.
+### Label mapping
 
----
+BraTS labels are remapped into four mutually exclusive softmax classes:
 
-## Preprocessing
+| Pipeline class | Meaning | Original BraTS label |
+| ---: | --- | ---: |
+| 0 | Background | 0 |
+| 1 | NCR/NET | 1 |
+| 2 | Oedema | 2 |
+| 3 | Enhancing tumour | 4 |
 
-### MRI normalisation
-
-Each MRI modality is independently z-score normalised over its non-zero voxels:
-
-```text
-x' = (x - mean_nonzero) / std_nonzero
-```
-
-Background voxels remain zero after normalisation.
-
-### Multi-class label mapping
-
-BraTS labels are remapped to a contiguous, mutually exclusive four-class representation:
-
-| BraTS label | Internal class | Meaning |
-|---|---:|---|
-| 0 | 0 | Background |
-| 1 | 1 | NCR/NET |
-| 2 | 2 | Oedema |
-| 4 | 3 | Enhancing tumour |
-
-The code also maps an existing label value of 3 to the enhancing tumour class for compatibility with already remapped datasets.
-
-The three standard BraTS evaluation regions are reconstructed as:
-
-- **WT:** classes 1, 2 and 3
-- **TC:** classes 1 and 3
-- **ET:** class 3
-
----
-
-## Preprocessed Cache and Data Loading
-
-Normalised data can be cached as memory-mapped NumPy arrays to reduce repeated NIfTI decompression and preprocessing.
-
-The cached formats are:
+The standard overlapping BraTS regions are reconstructed for evaluation:
 
 ```text
-MRI: float16
-label: uint8
+WT = classes 1 + 2 + 3
+TC = classes 1 + 3
+ET = class 3
 ```
 
-Runtime image tensors are converted back to `float32` on the GPU before augmentation and model execution.
+## Experimental design
 
-The pipeline uses:
-
-- 8 DataLoader workers
-- persistent workers
-- pinned-memory loading
-- worker-local memory-map handle caches
-- a RAM-bounded prefetch queue
-- a slice-major cache for 2D axial access
-- pre-padded 3D cached volumes
-
-The 2D slice-major cache stores slices contiguously in depth-first form to avoid strided disk reads.
-
----
-
-## Training Data Augmentation
-
-Augmentation is applied **on-the-fly on the GPU** after a training batch has been transferred to CUDA and before the model forward pass.
-
-No augmented duplicate is added to the dataset. Each training sample is transformed probabilistically each time it is encountered.
-
-The augmentation order is:
-
-1. random spatial flips
-2. affine transformation and/or elastic deformation
-3. multiplicative bias field
-4. Gaussian noise
-
-### Random flips
-
-Applied independently along each available spatial axis:
+The default training workflow uses one deterministic patient-level split:
 
 ```text
-p = 0.5 per axis
+80% training
+10% validation
+10% final held-out test
 ```
 
-The identical flip is applied to the MRI image and segmentation label.
-
-### Affine augmentation
+With the 369 labelled BraTS2020 cases, this gives approximately:
 
 ```text
-p = 0.3
-rotation: -10 to +10 degrees
-scaling: 0.9 to 1.1 independently by spatial axis
+295 training patients
+37 validation patients
+37 final test patients
 ```
 
-For 2D models, the transform is 2D. For 3D models, independent rotations and scaling factors are sampled across the three spatial axes.
-
-### Elastic deformation
+The split is generated using seed `123` and saved to:
 
 ```text
-p = 0.2
-control points = 7
-maximum displacement = 7 voxels
+runs/fixed_split.json
 ```
 
-Affine and elastic transforms are sampled independently. If both are selected, they are combined into one sampling grid.
+The same split file is reused across architectures when the metadata match.
 
-MRI images use linear interpolation and labels use nearest-neighbour interpolation.
+The validation subset is used for:
 
-### Intensity bias field
+- model selection
+- early stopping
+- best-checkpoint selection
+
+The final test subset is evaluated only after training and model selection are complete.
+
+## Loss function
+
+All architectures use the same multi-class objective:
 
 ```text
-p = 0.3
-bias strength = 0.3
+Loss = 0.5 x DiceLoss + 0.5 x CrossEntropyLoss
 ```
 
-A smooth coarse random field is interpolated to the full image dimensions, normalised, and converted to a multiplicative intensity field.
+The Dice component:
 
-### Gaussian noise
+- operates on softmax probabilities
+- excludes background
+- averages over the three foreground classes
+- uses smoothing of `1e-5`
+
+Cross-entropy is standard categorical cross-entropy over all four mutually exclusive classes.
+
+For the DeepEnsembled U-Net, the same combined loss is applied to the main prediction and each of the four deep-supervision outputs.
+
+## Data augmentation
+
+Training augmentation is implemented directly in PyTorch and applied on the GPU after batch transfer.
+
+Default augmentation probabilities are:
+
+| Augmentation | Probability | Configuration |
+| --- | ---: | --- |
+| Random flips | 0.5 per spatial axis | 2D or 3D axis matched |
+| Affine transformation | 0.3 | Rotation up to ±10 degrees, scale 0.9 to 1.1 |
+| Elastic deformation | 0.2 | 7 control points, maximum displacement 7 voxels |
+| Smooth bias field | 0.3 | Multiplicative intensity field |
+| Gaussian noise | 0.2 | Standard deviation sampled from 0 to 0.1 |
+
+MRI data use bilinear or trilinear interpolation for spatial transforms. Segmentation labels use nearest-neighbour interpolation.
+
+Disable all training augmentation with:
+
+```bash
+python brats_pipeline.py --model unet3d --no_model_prompt --no_augment
+```
+
+## Training defaults
+
+Important defaults include:
+
+| Setting | Default |
+| --- | --- |
+| Optimiser | AdamW |
+| Learning rate | `1e-4` |
+| Weight decay | `1e-5` |
+| Scheduler | Cosine annealing |
+| Maximum epochs | 300 |
+| Early stopping patience | 30 validation epochs without improvement |
+| Validation interval | Every epoch |
+| Seed | 123 |
+| AMP | Enabled |
+| Gradient clipping | Maximum norm 1.0 |
+| DataLoader workers | 8 |
+| CUDA required | Yes |
+| cuDNN benchmark | Enabled |
+| TF32 | Enabled |
+| `torch.compile` | Disabled by default |
+
+The selected checkpoint is the epoch with the best validation mean Dice.
+
+## Automatic batch-size tuning
+
+Automatic batch-size tuning is enabled by default. It performs real forward, backward, and optimiser probes and selects the largest stable physical batch that satisfies the configured CUDA memory policy.
+
+Important defaults:
 
 ```text
-p = 0.2
-sigma ~ Uniform(0, 0.1)
+Target VRAM fraction: 0.85
+Minimum free VRAM headroom: 1 GB
+2D starting batch size: 64
+3D starting batch size: 1
+UNet2D hard cap: 64
+Diff-UNet hard cap: 1
+DeepEnsemble member hard cap: 1
 ```
 
-Noise is added directly to the image tensor.
+The tuner performs a final forced-augmentation safety check and repeated memory-stability checks. Wall-clock timing variability is diagnostic only and does not cause batch-size rejection.
 
-Augmentation is disabled during validation and final testing.
-
----
-
-## Loss Function
-
-All models use the same multi-class composite loss:
+Selected batch sizes are cached in:
 
 ```text
-L = 0.5 * DiceLoss + 0.5 * CrossEntropyLoss
+runs/autobatch_cache.json
 ```
 
-### Dice loss
+Disable automatic tuning with:
 
-Dice is calculated from softmax probabilities and averaged across the three foreground classes only:
+```bash
+python brats_pipeline.py \
+  --model unet3d \
+  --no_model_prompt \
+  --no_auto_batch \
+  --batch_size 1
+```
 
-- NCR/NET
-- oedema
-- enhancing tumour
+## Memory-mapped preprocessing cache
 
-The background class is excluded from the Dice term.
+By default, NIfTI files are normalised once and converted into compact NumPy memory maps.
 
-The smoothing constant is:
+Default location:
 
 ```text
-epsilon = 1e-5
+<data_dir>/.brats_preprocessed_cache/
 ```
 
-### Categorical cross-entropy
-
-PyTorch `nn.CrossEntropyLoss()` is used without class-specific weights.
-
-Cross-entropy includes all four classes, including the background.
-
----
-
-## Optimisation
-
-Default optimisation settings are:
+Per patient, the main cache contains:
 
 ```text
-Optimizer: AdamW
-Initial learning rate: 1e-4
-Weight decay: 1e-5
-Scheduler: cosine annealing
-Maximum epochs: 300
-Early-stopping patience: 30 epochs
-Validation frequency: every epoch
-Random seed: 123
-Gradient accumulation: none
+image_f16.npy
+label_u8.npy
+foreground_by_z.npy
 ```
 
-One physical batch produces one optimiser update.
+The canonical 3D cache is stored at padded geometry `240 x 240 x 160`.
 
-Gradient clipping is applied with:
+For supported 2D paths, an optional axial slice-major cache is also created to reduce strided disk reads:
 
 ```text
-max_norm = 1.0
+image_axial_f16.npy
+label_axial_u8.npy
 ```
 
-Automatic mixed precision is enabled.
+The cache is disk-backed. Worker-local mmap handles and the operating-system file cache are used instead of loading the complete cohort into Python RAM.
 
-Fused AdamW is used where supported.
+Disable preprocessing cache creation with:
 
----
+```bash
+python brats_pipeline.py \
+  --model unet3d \
+  --no_model_prompt \
+  --no_preprocessed_cache
+```
 
-## Automatic Batch-Size Selection
+## Model-specific behaviour
 
-Batch size is model dependent and is selected automatically according to available GPU memory.
+### UNet2D
 
-The default target is:
+`unet2d` processes native axial slices of shape:
 
 ```text
-85% of total VRAM
+4 x 240 x 240
 ```
 
-with an additional emergency headroom floor of approximately 1 GB.
-
-Default starting batch sizes are:
+The corrected default retains all native axial training slices:
 
 ```text
-2D: 64
-3D: 1
+unet2d_skip_empty_ratio = 0.0
 ```
 
-The tuner uses real forward, backward and optimiser probes.
+The final held-out evaluation reconstructs each complete 3D patient before computing patient-level Dice and HD95.
 
-### Search behaviour
+### HVU / DenseVU-ED
 
-- UNet 2D can grow more aggressively.
-- Heavy 2D models use additive batch-size increments.
-- 3D models increase conservatively.
-- CUDA OOM conditions are caught and treated as failed probes rather than terminating the experiment.
-- If batch size 1 physically fits but exceeds the preferred 85% VRAM target, batch size 1 is accepted because no smaller physical batch exists.
-- Once this minimum-batch condition is reached, the tuner does not probe batch size 2.
-- The final candidate can be checked using forced worst-case GPU augmentation.
-- Stable batch sizes are stored in `autobatch_cache.json`.
-- A valid cached batch size is reused directly without additional probing.
-
----
-
-## Diff-UNet Memory Handling
-
-Diff-UNet receives several model-specific memory-management optimisations that do not change its architecture, input geometry, loss or augmentation distribution.
-
-### CUDA prefetch
-
-Asynchronous host-to-device batch prefetch is disabled for Diff-UNet so that the next full 3D batch is not simultaneously resident on the GPU.
-
-CPU-side DataLoader prefetch remains active.
-
-### Augmentation memory
-
-Large 3D augmentation tensors are reused or updated in place where safe, and temporary sampling grids and displacement tensors are deleted immediately after use.
-
-### Epoch loss accumulation
-
-The training loop uses one running loss accumulator rather than retaining a detached CUDA loss tensor for every batch.
-
-### CUDA timing
-
-One CUDA event pair is used for epoch-level GPU timing instead of retaining an event pair for every batch.
-
-### CUDA allocator cache
-
-For Diff-UNet only:
-
-```python
-torch.cuda.empty_cache()
-```
-
-is called every 10 training batches to return unused cached CUDA blocks to the driver.
-
-This does not remove live model tensors, gradients or optimiser state, but it can introduce a small training-time overhead.
-
----
-
-## HybridAttUnet Batch-Size-1 Handling
-
-HybridAttUnet can reach a deepest feature tensor of:
+`hvu` receives the same 240 x 240 axial slices but internally resizes them to:
 
 ```text
-[1, 512, 1, 1, 1]
+256 x 256
 ```
 
-when the physical training batch size is 1.
+Its bottleneck combines:
 
-Standard `BatchNorm3d` cannot estimate batch statistics from a single value per channel. The implementation therefore uses a batch-size-1-safe BatchNorm fallback inside HybridAttUnet.
+- U-Net local features
+- DenseNet121 architectural features
+- Vision Transformer global features
 
-When more than one value per channel is available, normal BatchNorm behaviour is used. In the degenerate `1 x 1 x 1` case, the layer uses its stored running statistics.
+The DenseNet branch is initialised without pretrained weights.
 
----
+### DeepLabV3+
 
-## Learning-Rate Scheduling and Early Stopping
+`deeplabv3plus2d` uses:
 
-The default scheduler is cosine annealing.
+- a ResNet-50 style encoder
+- output stride 16
+- atrous spatial pyramid pooling with rates 6, 12, and 18
+- low-level feature fusion in the decoder
 
-Validation is performed after every epoch.
+It is trained from scratch.
 
-The checkpoint with the highest mean validation Dice is stored as the best model.
+### HybridAttUNet
 
-Training stops if the validation Dice does not improve for:
+`hybridattunet` accepts the common padded full-volume input but internally resizes it to:
 
 ```text
-30 consecutive epochs
+128 x 128 x 128
 ```
 
-The final held-out test set is evaluated only after the best checkpoint has been selected.
+The implementation includes:
 
----
+- residual bottleneck blocks
+- four residual-attention skip modules
+- attention depths 1, 2, 3, and 4
+- squeeze-excitation recalibration in the decoder
 
-## Segmentation Metrics
+Logits are resized back to the pipeline input geometry before the common loss and evaluation.
 
-Final segmentation metrics are calculated at the patient level.
+### Diff-UNet
 
-For the 2D models, all axial predictions are reconstructed into a complete 3D patient volume before final metrics are calculated.
+`diff_unet` is a four-class adaptation of Diff-UNet.
 
-### Dice
+Training uses:
 
-The pipeline reports:
+- a separate 3D MRI image encoder
+- one-hot segmentation states mapped to `[-1, 1]`
+- random diffusion timesteps from `T = 1000`
+- START_X parameterisation
+- the same Dice plus categorical cross-entropy objective used by the other architectures
 
-- DiceCoef, mean of WT, TC and ET Dice
-- DiceWT
-- DiceTC
-- DiceET
+Inference uses deterministic DDIM-style sampling with:
+
+```text
+50 denoising steps
+```
+
+Because of its full-volume memory requirement, its physical batch size is capped at 1 by default and asynchronous CUDA batch prefetch is disabled.
+
+### DeepEnsembled U-Net
+
+`deepensemble` trains five Henry-style 3D U-Net members sequentially using seeds:
+
+```text
+123, 124, 125, 126, 127
+```
+
+Each member uses:
+
+- width 48
+- GroupNorm
+- a dilated pseudo-fifth stage
+- trilinear decoder upsampling
+- four deep-supervision outputs
+- activation checkpointing during training
+
+At inference, probabilities are averaged across all members. With default TTA enabled, each member is evaluated using 16 transformations:
+
+```text
+5 members x 16 TTA predictions = 80 predictions per patient
+```
+
+Disable DeepEnsemble TTA with:
+
+```bash
+python brats_pipeline.py \
+  --model deepensemble \
+  --no_model_prompt \
+  --no_deepensemble_tta
+```
+
+## Evaluation metrics
+
+The pipeline reports patient-level metrics for:
+
+- Whole tumour, WT
+- Tumour core, TC
+- Enhancing tumour, ET
+
+### Dice coefficient
+
+Dice is calculated from the reconstructed region masks.
+
+The reported overall Dice is:
+
+```text
+DiceMean = mean(DiceWT, DiceTC, DiceET)
+```
 
 ### HD95
 
-The implementation computes a symmetric pooled bidirectional 95th-percentile surface Hausdorff distance.
+HD95 is computed from the symmetric set of nearest surface distances and reported in voxel units.
 
-For masks `X` and `Y`, nearest-surface distances are calculated in both directions, pooled, and the 95th percentile is taken.
+Empty-mask handling is:
 
-The implementation uses:
+```text
+Prediction empty and target empty -> 0
+Only one mask empty              -> NaN
+Both masks non-empty             -> HD95 calculated
+```
 
-- binary surface extraction
-- Euclidean distance transforms
-- a tight union bounding box for computational efficiency
-- CPU thread parallelism where appropriate
+NaN values are excluded from summary means.
 
-HD95 is currently calculated in voxel units.
+The reported overall HD95 is the mean of the valid WT, TC, and ET HD95 values for each patient.
 
-If both masks are empty, HD95 is 0. If only one mask is empty, HD95 is reported as NaN.
+## Computational metrics
 
----
+The fixed-split experiment also reports:
 
-## Efficiency Metrics
+| Metric | Meaning |
+| --- | --- |
+| `Training time (s)` | Total wall-clock training time to the selected stopping point |
+| `Trainable Params` | Number of trainable model parameters |
+| `GFLOPs` | Complete patient-level inference workload, multiply-add counted as 2 FLOPs |
+| `Dice/s` | Mean test Dice divided by inference time in seconds |
+| `Dice/M` | Mean test Dice divided by trainable parameters in millions |
+| `Inference (ms)` | Mean patient-level forward inference latency after warm-up |
+| `Peak VRAM (GB)` | Maximum allocated CUDA memory observed during training |
 
-The aggregate efficiency table contains:
+For 2D architectures, per-slice FLOPs are accumulated over all slices evaluated for the patient.
+
+For Diff-UNet, GFLOPs include all 50 denoising evaluations.
+
+For the DeepEnsembled U-Net, GFLOPs and latency include all ensemble members and all enabled TTA transformations.
+
+## Installation
+
+### Required packages
+
+The core pipeline requires:
+
+```text
+numpy
+torch
+nibabel
+scipy
+```
+
+Additional packages used by specific features are:
+
+```text
+torchvision    # required for HVU / DenseVU-ED
+tqdm           # optional live progress bars
+tensorboard    # optional TensorBoard logging
+psutil         # optional host-memory reporting
+```
+
+A typical environment can be prepared with:
+
+```bash
+pip install numpy nibabel scipy tqdm tensorboard psutil
+```
+
+Install PyTorch and torchvision separately using the build appropriate for your GPU and CUDA environment.
+
+For an RTX 5090 or another Blackwell-class GPU, the PyTorch build must include support for compute capability 12.0 (`sm_120` or `compute_120`). The script performs a CUDA allocation and matrix-multiplication sanity check before dataset preparation begins.
+
+## Usage
+
+### List available models
+
+```bash
+python brats_pipeline.py --list_models
+```
+
+### Interactive training
+
+Training mode opens a numbered model menu by default:
+
+```bash
+python brats_pipeline.py --data_dir /path/to/BraTS2020
+```
+
+Even if `--model` is supplied, the interactive menu remains the default unless `--no_model_prompt` is also used.
+
+### Non-interactive training
+
+For scripted runs, supply both `--model` and `--no_model_prompt`:
+
+```bash
+python brats_pipeline.py \
+  --mode train \
+  --model unet3d \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020 \
+  --save_dir ./runs
+```
+
+Example for UNet2D:
+
+```bash
+python brats_pipeline.py \
+  --model unet2d \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020 \
+  --epochs 300
+```
+
+Example for Diff-UNet:
+
+```bash
+python brats_pipeline.py \
+  --model diff_unet \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020
+```
+
+Example for the DeepEnsembled U-Net:
+
+```bash
+python brats_pipeline.py \
+  --model deepensemble \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020
+```
+
+### Explicit labelled training directory
+
+If automatic cohort detection is ambiguous:
+
+```bash
+python brats_pipeline.py \
+  --model hybridattunet \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020 \
+  --train_data_dir /path/to/BraTS2020/BraTS20_Training
+```
+
+### Resume training
+
+```bash
+python brats_pipeline.py \
+  --model unet3d \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020 \
+  --checkpoint runs/unet3d_YYYYMMDD_HHMMSS_fixed_80_10_10/last.pth
+```
+
+### Standalone evaluation
+
+A checkpoint can be loaded with:
+
+```bash
+python brats_pipeline.py \
+  --mode eval \
+  --model unet3d \
+  --data_dir /path/to/BraTS2020 \
+  --checkpoint /path/to/best.pth
+```
+
+The main fixed-split training workflow already performs the final held-out test evaluation automatically after selecting the best validation checkpoint.
+
+The standalone `Evaluator` path currently constructs a validation split from `--data_dir`, `--val_ratio`, and `--seed`. It should therefore not be confused with the one-time fixed 10% final-test evaluation performed automatically by `FixedSplitRunner`. The standalone evaluator also uses the volumetric dataset path directly, so the automatic fixed-split evaluation is the preferred evaluation route for the 2D architectures.
+
+## Optional cross-validation mode
+
+The file retains an optional k-fold workflow:
+
+```bash
+python brats_pipeline.py \
+  --model unet3d \
+  --no_model_prompt \
+  --data_dir /path/to/BraTS2020 \
+  --cv \
+  --n_folds 10 \
+  --test_ratio 0.10
+```
+
+This is separate from the default fixed 80/10/10 experiment and is not required for the main workflow.
+
+## Output files
+
+The default `save_dir` is:
+
+```text
+./runs
+```
+
+### Shared experiment outputs
+
+Across model runs, the pipeline maintains:
+
+```text
+runs/
+├── fixed_split.json
+├── autobatch_cache.json
+├── run.log
+├── segmentation_metrics.csv
+├── efficiency_metrics.csv
+├── model_metrics.csv
+├── final_test_per_patient_<model>.csv
+└── final_test_summary_<model>.csv
+```
+
+`segmentation_metrics.csv` contains one row per model with:
+
+```text
+Model
+DiceCoef
+HD95
+DiceET
+DiceWT
+DiceTC
+```
+
+`efficiency_metrics.csv` contains:
 
 ```text
 Model
@@ -450,290 +633,112 @@ Inference (ms)
 Peak VRAM (GB)
 ```
 
-### Training time
+`model_metrics.csv` combines both sets of columns.
 
-Training time is the total wall-clock time required to train the model to its selected stopping point, including validation performed during training.
+The per-patient final-test files are intended for paired architecture comparisons and statistical analysis.
 
-### Trainable parameters
+### Per-run outputs
 
-Only parameters with `requires_grad=True` are counted.
-
-### GFLOPs
-
-GFLOPs represent forward inference complexity per complete patient.
-
-- 2D models: per-slice complexity accumulated across the axial slices required for a full patient volume
-- 3D models: complete volumetric forward inference
-- Diff-UNet: includes its iterative inference procedure
-
-Multiply-add operations are counted as two floating-point operations.
-
-### Dice/s
+Each training run also creates a timestamped directory such as:
 
 ```text
-Dice/s = mean DiceCoef / inference time in seconds per patient
+runs/unet3d_YYYYMMDD_HHMMSS_fixed_80_10_10/
 ```
 
-### Dice/M
+Typical contents include:
 
 ```text
-Dice/M = mean DiceCoef / trainable parameters in millions
+config.json
+training_history.csv
+best.pth
+last.pth
+fixed_split_experiment_summary.json
+tb/
 ```
 
-### Inference latency
-
-Inference latency is the mean model forward-pass latency per patient after warm-up.
-
-It excludes:
-
-- disk I/O
-- preprocessing
-- data loading
-- Dice calculation
-- HD95 calculation
-
-CUDA timing events are used for GPU latency measurement.
-
-### Peak VRAM
-
-Peak VRAM is measured during training using:
-
-```python
-torch.cuda.max_memory_allocated()
-```
-
-The peak-memory counter is reset at the beginning of each training run.
-
-The value represents total peak allocated GPU memory for the training process and selected batch size, not memory per sample.
-
----
-
-## Output Files
-
-The default output directory is:
-
-```text
-./runs
-```
-
-The pipeline creates model-specific run directories containing logs, configuration, checkpoints and training history.
-
-Important outputs include:
-
-```text
-fixed_split.json
-autobatch_cache.json
-segmentation_metrics.csv
-efficiency_metrics.csv
-model_metrics.csv
-```
-
-Per-model final-test outputs include:
-
-```text
-final_test_per_patient_<model>.csv
-final_test_summary_<model>.csv
-```
-
-Each run directory can also contain:
+For the DeepEnsembled U-Net, each member receives its own run directory and the final ensemble directory also stores:
 
 ```text
 best.pth
-last.pth
-config.json
-run_metrics.json
-fixed_split_experiment_summary.json
-run.log
+ensemble_members.json
 ```
 
-TensorBoard logs are generated when TensorBoard is installed.
+## Reproducibility notes
 
----
+- Default random seed is `123`.
+- The fixed patient split is persisted and reused across models.
+- The official unlabelled BraTS2020 validation cohort is excluded from the main experiment.
+- Validation is performed every epoch by default.
+- Early stopping is based on validation mean Dice.
+- Final test evaluation occurs only after model selection.
+- All models use the same four-class formulation and common combined loss.
+- Data augmentation is disabled during validation and testing.
+- DeepEnsemble members use consecutive seeds starting from the configured base seed.
+- `torch.compile` is disabled by default because repeated compilation and autotuning can consume substantial host memory on Windows.
 
-## Checkpoint Behaviour
+## Hardware and performance notes
 
-`last.pth` stores the most recent checkpoint.
+The implementation includes several optimisations intended for large BraTS workloads on CUDA GPUs:
 
-`best.pth` stores the checkpoint with the highest validation Dice.
-
-Checkpoint state includes:
-
-- epoch
-- model name
-- model state dictionary
-- optimiser state
-- Dice score
-- early-stopping counter
-- best validation metrics
-- full configuration
-
----
-
-## Resource Cleanup
-
-The pipeline includes explicit cleanup to minimise lingering RAM and VRAM after training or script termination.
-
-Cleanup includes:
-
-- closing TensorBoard writers
-- shutting down persistent DataLoader workers
-- clearing worker and dataset memory-map caches
-- deleting model, optimiser, scheduler, scaler and augmentation objects when no longer required
-- Python garbage collection
-- CUDA synchronisation
-- `torch.cuda.empty_cache()`
-- `torch.cuda.ipc_collect()`
-- termination of surviving multiprocessing children
-- logging shutdown
-
-Training resources are released before the final test model is loaded.
-
-A process-wide cleanup is also attempted when execution finishes or exits through an exception.
-
-Once the Python interpreter exits, the operating system reclaims all remaining RAM and VRAM owned by the process.
-
----
-
-## CUDA Runtime Configuration
-
-The script sets:
-
-```text
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-```
-
-before importing PyTorch to reduce CUDA allocator fragmentation.
-
-It also enables, where available:
-
+- AMP
+- fused AdamW where supported
+- TF32 where supported
 - cuDNN benchmarking
-- TF32
-- channels-last-3D memory format for selected 3D CNNs
-- fused AdamW
-- automatic mixed precision
+- channels-last 3D memory format for selected CNNs
+- pinned-memory DataLoaders
+- asynchronous CUDA prefetch where memory permits
+- memory-mapped preprocessing
+- patient-grouped 2D batches
+- RAM-bounded DataLoader prefetch
+- activation checkpointing for DeepEnsemble members
+- explicit worker and CUDA cleanup at process exit
 
-`torch.compile` is disabled by default because of host-RAM pressure observed under Windows.
-
-CUDA is required by default. The script does not silently fall back to CPU execution.
-
----
-
-## Dependencies
-
-Core dependencies include:
-
-```text
-Python
-PyTorch
-NumPy
-NiBabel
-SciPy
-```
-
-The HVU DenseVU-ED implementation additionally requires:
-
-```text
-torchvision
-```
-
-Optional packages include:
-
-```text
-tqdm
-tensorboard
-```
-
-`nvidia-smi` is used when available for GPU telemetry such as utilisation, temperature, clock speed and power.
-
----
-
-## Typical Usage
-
-### Interactive training
+CUDA is required by default to prevent accidental multi-hour CPU training. CPU execution must be explicitly enabled with:
 
 ```bash
-python brats_pipeline_5090.py --data_dir /path/to/BraTS2020
+--allow_cpu
 ```
 
-The script presents the seven-model selection menu.
+Full-volume 3D training on CPU is not expected to be practical.
 
-### List models
+## Important interpretation notes
 
-```bash
-python brats_pipeline_5090.py --list_models
-```
+This is a controlled comparison pipeline, not an attempt to reproduce the individually optimised performance of every source architecture.
 
-### Scripted model selection
+Several architectures have been adapted to a common experimental setting:
 
-```bash
-python brats_pipeline_5090.py \
-    --model unet2d \
-    --data_dir /path/to/BraTS2020
-```
+- four mutually exclusive output classes
+- common Dice plus categorical cross-entropy loss
+- fixed patient split
+- common augmentation framework
+- common model selection procedure
+- full-volume BraTS geometry for the 3D comparison
 
-Depending on the current prompt-first CLI settings, the explicit no-prompt option may be required for fully unattended execution.
+Accordingly, results should be interpreted as the behaviour of these implementations under the shared protocol rather than as exact reproductions of the original published systems.
 
-### Evaluate a checkpoint
+In particular:
 
-```bash
-python brats_pipeline_5090.py \
-    --mode eval \
-    --model diff_unet \
-    --checkpoint /path/to/best.pth \
-    --data_dir /path/to/BraTS2020
-```
+- HybridAttUNet is an architecture-faithful PyTorch reimplementation rather than a bit-for-bit reproduction of unpublished source code.
+- Diff-UNet is adapted to four-class multi-class segmentation and the common study loss.
+- DeepEnsemble retains major Henry et al. architectural and inference elements but uses the study's fixed split and four-class formulation.
+- HVU / DenseVU-ED is implemented from the architectural description and uses no pretrained DenseNet weights.
 
----
+## References represented in the implementation
 
-## Reproducibility Notes
+The source code explicitly draws on or adapts ideas from:
 
-The default random seed is:
+- Ronneberger et al., U-Net
+- Çiçek et al., 3D U-Net
+- Renugadevi et al., DenseVU-ED / Hybrid Vision U-Net
+- Hybrid Attention-Based Residual U-Net
+- Henry et al., BraTS2020 deep ensemble
+- Xing et al., Diff-UNet
+- DeepLabV3+
 
-```text
-123
-```
+Consult the associated papers and repositories when using the models for research reporting.
 
-The fixed patient split is persisted to disk and reused across models.
+## Licence
 
-A fixed seed improves reproducibility but does not guarantee bit-for-bit identical CUDA results because some GPU kernels can remain nondeterministic.
+No licence is declared by this pipeline file itself. Before redistributing the code or model implementations, ensure that your repository licence is compatible with the licences of any source projects, dependencies, and datasets on which the implementations are based.
 
-For manuscript reproducibility, the final repository commit hash, PyTorch version, CUDA version, cuDNN version and GPU driver version should be recorded after the final experimental code has been frozen.
-
----
-
-## Default Experimental Configuration
-
-| Setting | Default |
-|---|---|
-| Data split | Fixed patient-level 80/10/10 |
-| Validation | Every epoch |
-| Maximum epochs | 300 |
-| Early stopping | 30 epochs without Dice improvement |
-| Loss | 0.5 Dice + 0.5 categorical cross-entropy |
-| Optimiser | AdamW |
-| Learning rate | `1e-4` |
-| Weight decay | `1e-5` |
-| Scheduler | Cosine annealing |
-| AMP | Enabled |
-| Gradient accumulation | None |
-| Workers | 8 |
-| Auto batch | Enabled |
-| VRAM target | 85% |
-| Seed | 123 |
-| CUDA required | Yes |
-| `torch.compile` | Disabled by default |
-| Official BraTS validation cohort | Not used |
-
----
-
-## Important Methodological Notes
-
-1. The experiment is **not ten-fold cross-validation** by default. The current design is one fixed 80/10/10 patient-level split.
-2. Batch size is **model dependent**, not fixed at four.
-3. The 3D networks receive depth-padded `240 x 240 x 160` volumes.
-4. Final 2D segmentation metrics are calculated volumetrically after reconstructing complete patient volumes.
-5. Peak VRAM refers to **peak allocated training memory**, not Task Manager or `nvidia-smi` reserved-memory readings.
-6. Inference latency refers to **model forward-pass latency per patient**, excluding I/O and metric computation.
-7. Diff-UNet uses memory-management changes that do not alter its architecture or augmentation distribution.
-8. HybridAttUnet includes a batch-size-1-safe normalisation fallback at its deepest `1 x 1 x 1` feature map.
-9. The code still contains optional cross-validation support for compatibility, but `cv=False` is the default and is not part of the current primary experiment.
+BraTS data are distributed separately and are not included in this repository.
