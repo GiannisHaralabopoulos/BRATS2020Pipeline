@@ -4,7 +4,7 @@ Unified Brain Tumor Segmentation Pipeline
 Consolidates training and evaluation from:
   - HVU-ED paper         (2-D DenseVU-ED: DenseNet121 + ViT + U-Net)
   - HybridAttUnet 3D       (3-D Hybrid Attention-Based Residual U-Net, HA-RUnet)
-  - open_brats2020       (DeepEnsemble 3D, based on EquiUnet, PyTorch, Top-10 BraTS solution)
+  - Henry et al. 2020    (DeepEnsemble 3D, deep-supervised 3-D U-Net ensemble, BraTS 2020)
   - Diff-UNet            (Diffusion-embedded UNet, PyTorch, 3D)
   - PyTorch-UNet         (Vanilla 3D UNet, PyTorch)
 
@@ -51,12 +51,14 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
@@ -238,6 +240,7 @@ DEFAULT_CFG = {
     "slice_major_cache_2d": True,     # store axial slices as (D,C,H,W) so every 2-D slice is contiguous on disk
     "cuda_prefetch": True,            # overlap pinned-memory H2D transfer with GPU compute for models that can afford it
     "diff_unet_cuda_prefetch": False, # Diff-UNet: keep only the current full-volume batch resident on CUDA
+    "deepensemble_cuda_prefetch": False, # avoid a second full-volume CUDA batch while training ensemble members
     "hd95_workers": 4,                # parallel CPU workers for validation/test surface distances
     "profile_pipeline": True,          # report data-wait vs GPU-compute time each epoch
     "gpu_telemetry": True,             # log NVIDIA temperature/clock/power/utilisation each epoch when nvidia-smi is available
@@ -249,6 +252,9 @@ DEFAULT_CFG = {
     "in_channels":     4,
     "num_classes":     4,             # 0=background, 1=NCR/NET, 2=edema, 3=ET (mutually exclusive)
     "base_filters":    32,
+    "unet2d_norm_groups": 8,
+    "unet2d_max_batch_size": 64,
+    "unet2d_skip_empty_ratio": 0.0,  # retain all native axial slices for UNet2D
 
     # Training
     "mode":            "train",
@@ -260,14 +266,15 @@ DEFAULT_CFG = {
     "batch_vram_headroom_gb": 1.0,      # emergency free-memory floor in addition to the 85% VRAM target
     "batch_size_step": 16,             # final 2-D search granularity
     "max_batch_size_2d": 4096,         # high ceiling; tuner stops at the 85% VRAM target
-    "max_batch_size_3d": 32,           # high ceiling; tuner stops at the 85% VRAM target
+    "max_batch_size_3d": 32,           # high ceiling for conventional 3-D models
+    "diff_unet_max_batch_size": 1,     # corrected full-volume Diff-UNet: never probe batch 2 on Windows
     "autobatch_disk_cache": True,      # persist tuned batch sizes as a starting point across runs
     "autobatch_revalidate_cache": False, # cached batch is authoritative; reuse immediately without probing
-    "autobatch_cache_version": 7,      # invalidate batch sizes from older augmentation/tuner implementations
+    "autobatch_cache_version": 9,      # memory-only repeated stability criterion
     "autobatch_cache_file": None,      # default: <save_dir>/autobatch_cache.json
     "autobatch_final_aug_check": True, # run expensive worst-case GPU augmentation only on final candidate
     "autobatch_stability_steps": 3,       # consecutive full-augmentation probes before accepting a new batch size
-    "autobatch_stability_slowdown": 1.50, # reject a candidate if repeated probe time becomes unstable
+    "autobatch_stability_slowdown": 1.50, # legacy/unused: timing no longer affects batch selection
     "lr":              1e-4,
     "weight_decay":    1e-5,
     "scheduler":       "cosine",      # cosine | plateau | none
@@ -298,7 +305,18 @@ DEFAULT_CFG = {
 
     # Diff-UNet specific
     "diffusion_steps": 1000,
-    "diffusion_infer_steps": 10,
+    "diffusion_infer_steps": 50,
+
+    # DeepEnsemble specific, adapted from Henry et al. (arXiv:2011.01045)
+    "deepensemble_members": 5,
+    "deepensemble_width": 48,
+    "deepensemble_tta": True,
+    "deepensemble_deep_supervision": True,
+    "deepensemble_norm_groups": 16,
+    "deepensemble_activation_checkpointing": True,
+    "deepensemble_checkpoint_losses": True,
+    "deepensemble_max_batch_size": 1,
+    "deepensemble_empty_cache_interval": 10,
 
     # Cross-validation
     "cv":              False,   # enable k-fold CV
@@ -320,6 +338,9 @@ def build_config(args: argparse.Namespace) -> dict:
     for k, v in vars(args).items():
         if v is not None:
             cfg[k] = v
+    if bool(getattr(args, "no_deepensemble_tta", False)):
+        cfg["deepensemble_tta"] = False
+    cfg.pop("no_deepensemble_tta", None)
     return cfg
 
 
@@ -608,8 +629,11 @@ def cuda_prefetch_enabled(cfg: dict) -> bool:
     CUDA at the same time adds memory pressure without changing the model.
     """
     enabled = bool(cfg.get("cuda_prefetch", True))
-    if str(cfg.get("model", "")).lower() == "diff_unet":
+    model_name = str(cfg.get("model", "")).lower()
+    if model_name == "diff_unet":
         enabled = enabled and bool(cfg.get("diff_unet_cuda_prefetch", False))
+    elif model_name == "deepensemble":
+        enabled = enabled and bool(cfg.get("deepensemble_cuda_prefetch", False))
     return enabled
 
 
@@ -1990,8 +2014,8 @@ def estimate_gflops(model: nn.Module, sample: torch.Tensor, cfg: dict) -> float:
     Estimate forward-pass GFLOPs with runtime shape hooks. Multiply-add is
     counted as two FLOPs. Conv2d/3d, transposed convolutions, Linear and
     MultiheadAttention are included. The returned value is for one supplied
-    input sample. For Diff-UNet this naturally includes all iterative denoising
-    steps executed by ``model(sample)``.
+    input sample. For Diff-UNet this naturally includes the separate image encoder and all
+    50 iterative START_X denoising steps executed by ``model(sample)``.
     """
     eager = unwrap_model(model)
     total_flops = 0.0
@@ -2416,196 +2440,668 @@ class HybridAttUnet3D(nn.Module):
         return logits
 
 
-# ── 3. DeepEnsemble 3D  (based on lescientifik/open_brats2020 EquiUnet, PyTorch) ─────────────────────
+# ── 3. DeepEnsemble 3D  (Henry et al., BraTS 2020) ──────────────────────────
 
-class EquiBlock(nn.Module):
-    """Width-equivariant residual block used in open_brats2020."""
-    def __init__(self, in_c: int, out_c: int):
+class HenryGroupNorm3d(nn.GroupNorm):
+    """GroupNorm used by the Henry et al. Pipeline A / open_brats2020 default."""
+    def __init__(self, channels: int, max_groups: int = 16):
+        groups = min(int(max_groups), int(channels))
+        while groups > 1 and channels % groups != 0:
+            groups -= 1
+        super().__init__(groups, channels)
+
+
+class HenryConvNormRelu(nn.Module):
+    """3x3x3 convolution followed by GroupNorm and ReLU."""
+    def __init__(self, in_c: int, out_c: int, groups: int = 16,
+                 dilation: int = 1, dropout: float = 0.0):
         super().__init__()
-        self.match = nn.Conv3d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
-        self.block = nn.Sequential(
-            ConvBnRelu(in_c, out_c),
-            ResBlock(out_c),
+        self.conv = nn.Conv3d(
+            in_c, out_c, kernel_size=3, stride=1,
+            padding=dilation, dilation=dilation, bias=False
+        )
+        self.norm = HenryGroupNorm3d(out_c, groups)
+        self.act = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x):
+        return self.drop(self.act(self.norm(self.conv(x))))
+
+
+class HenryUBlock(nn.Module):
+    """Two-convolution U-Net stage matching the reference EquiUnet."""
+    def __init__(self, in_c: int, mid_c: int, out_c: int,
+                 groups: int = 16, dilation=(1, 1), dropout: float = 0.0):
+        super().__init__()
+        self.c1 = HenryConvNormRelu(
+            in_c, mid_c, groups=groups, dilation=int(dilation[0]), dropout=dropout
+        )
+        self.c2 = HenryConvNormRelu(
+            mid_c, out_c, groups=groups, dilation=int(dilation[1]), dropout=dropout
         )
 
     def forward(self, x):
-        return self.block(x) + self.match(x)
+        return self.c2(self.c1(x))
+
+
+class HenryEquiUNet3D(nn.Module):
+    """
+    Paper-based 3-D U-Net backbone adapted from Henry et al. (2020),
+    arXiv:2011.01045, and the accompanying open_brats2020 EquiUnet code.
+
+    Architectural elements retained from the paper:
+      * four encoder stages, width 48 then doubling after each pooling step
+      * two 3x3x3 convolutions per encoder stage
+      * GroupNorm + ReLU
+      * pseudo-fifth stage made of two dilation-2 convolutions without
+        additional spatial downsampling
+      * concatenation of the dilated block with encoder stage 4
+      * trilinear decoder upsampling and concatenated skip connections
+      * four deep-supervision heads
+
+    Study-specific adaptation:
+      * four mutually exclusive classes and the common multi-class CombinedLoss
+        are retained for comparability with the other six architectures.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 4,
+        out_channels: int = 4,
+        width: int = 48,
+        norm_groups: int = 16,
+        deep_supervision: bool = True,
+        dropout: float = 0.0,
+        activation_checkpointing: bool = True,
+    ):
+        super().__init__()
+        w = int(width)
+        f0, f1, f2, f3 = w, w * 2, w * 4, w * 8
+
+        self.deep_supervision = bool(deep_supervision)
+        self.activation_checkpointing = bool(activation_checkpointing)
+        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+        self.encoder1 = HenryUBlock(in_channels, f0, f0, norm_groups, dropout=dropout)
+        self.encoder2 = HenryUBlock(f0, f1, f1, norm_groups, dropout=dropout)
+        self.encoder3 = HenryUBlock(f1, f2, f2, norm_groups, dropout=dropout)
+        self.encoder4 = HenryUBlock(f2, f3, f3, norm_groups, dropout=dropout)
+
+        # Pseudo-fifth stage, exactly the paper's dilation trick.
+        self.bottom = HenryUBlock(
+            f3, f3, f3, norm_groups, dilation=(2, 2), dropout=dropout
+        )
+        self.bottom_2 = HenryConvNormRelu(
+            f3 * 2, f2, groups=norm_groups, dilation=1, dropout=dropout
+        )
+
+        self.decoder3 = HenryUBlock(
+            f2 * 2, f2, f1, norm_groups, dropout=dropout
+        )
+        self.decoder2 = HenryUBlock(
+            f1 * 2, f1, f0, norm_groups, dropout=dropout
+        )
+        self.decoder1 = HenryUBlock(
+            f0 * 2, f0, f0, norm_groups, dropout=dropout
+        )
+
+        self.outconv = nn.Conv3d(f0, out_channels, kernel_size=1, bias=True)
+
+        if self.deep_supervision:
+            self.deep_bottom = nn.Conv3d(f3, out_channels, kernel_size=1)
+            self.deep_bottom2 = nn.Conv3d(f2, out_channels, kernel_size=1)
+            self.deep3 = nn.Conv3d(f1, out_channels, kernel_size=1)
+            self.deep2 = nn.Conv3d(f0, out_channels, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.GroupNorm, nn.InstanceNorm3d, nn.BatchNorm3d)):
+                if getattr(m, "weight", None) is not None:
+                    nn.init.ones_(m.weight)
+                if getattr(m, "bias", None) is not None:
+                    nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _upsample_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(
+            x, size=ref.shape[2:], mode="trilinear", align_corners=True
+        )
+
+    @staticmethod
+    def _upsample_to_input(x: torch.Tensor, spatial_shape) -> torch.Tensor:
+        if tuple(x.shape[2:]) == tuple(spatial_shape):
+            return x
+        return F.interpolate(
+            x, size=spatial_shape, mode="trilinear", align_corners=True
+        )
+
+    def _run_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run a Henry U-Net block with activation checkpointing during training.
+        The block computation is unchanged; internal activations are recomputed
+        during backward instead of being retained from the forward pass.
+        """
+        if (
+            self.training
+            and self.activation_checkpointing
+            and torch.is_grad_enabled()
+        ):
+            return checkpoint(block, x, use_reentrant=False)
+        return block(x)
+
+    def forward(self, x: torch.Tensor):
+        down1 = self._run_block(self.encoder1, x)
+        down2 = self._run_block(self.encoder2, self.pool(down1))
+        down3 = self._run_block(self.encoder3, self.pool(down2))
+        down4 = self._run_block(self.encoder4, self.pool(down3))
+
+        bottom = self._run_block(self.bottom, down4)
+        bottom_2 = self._run_block(
+            self.bottom_2, torch.cat([down4, bottom], dim=1)
+        )
+
+        up3 = self._upsample_like(bottom_2, down3)
+        up3 = self._run_block(
+            self.decoder3, torch.cat([down3, up3], dim=1)
+        )
+
+        up2 = self._upsample_like(up3, down2)
+        up2 = self._run_block(
+            self.decoder2, torch.cat([down2, up2], dim=1)
+        )
+
+        up1 = self._upsample_like(up2, down1)
+        up1 = self._run_block(
+            self.decoder1, torch.cat([down1, up1], dim=1)
+        )
+
+        logits = self.outconv(up1)
+
+        if self.training and self.deep_supervision:
+            # Keep aux logits at native resolution. The loss helper upsamples
+            # one head at a time, giving the same loss values without holding
+            # four full-resolution auxiliary logits at once.
+            aux_native = [
+                self.deep_bottom(bottom),
+                self.deep_bottom2(bottom_2),
+                self.deep3(up3),
+                self.deep2(up2),
+            ]
+            return logits, aux_native
+
+        return logits
+
+
+def _deepensemble_tta_spec():
+    """Identity plus 15 flip/rotation transforms, matching open_brats2020."""
+    specs = [(None, 0)]
+    for flip in (2, 3, 4, None):
+        for rot in (1, 2, 3, 0):
+            if flip is None and rot == 0:
+                continue
+            specs.append((flip, rot))
+    return specs
+
+
+def _apply_deepensemble_tta(x: torch.Tensor, flip, rot):
+    y = x
+    if flip is not None:
+        y = torch.flip(y, dims=(int(flip),))
+    if rot:
+        # Our tensors are (B,C,H,W,D). Rotate in the axial H/W plane.
+        y = torch.rot90(y, int(rot), dims=(2, 3))
+    return y
+
+
+def _revert_deepensemble_tta(x: torch.Tensor, flip, rot):
+    # Forward transform is R(F(x)); inverse is F(R^{-1}(x)).
+    y = x
+    if rot:
+        y = torch.rot90(y, -int(rot), dims=(2, 3))
+    if flip is not None:
+        y = torch.flip(y, dims=(int(flip),))
+    return y
 
 
 class DeepEnsemble3D(nn.Module):
     """
-    DeepEnsemble 3D, based on the Equivariant U-Net (EquiUnet) from open_brats2020 (Top-10 BraTS 2020).
-    Ref: https://arxiv.org/abs/2011.01045
+    Inference wrapper for independently trained Henry-style members.
+
+    Member probabilities are averaged. By default each member is evaluated
+    with the 16-way TTA scheme used by the reference repository.
     """
-    def __init__(self, in_channels: int = 4, out_channels: int = 3,
-                 width: int = 48):
+    def __init__(
+        self,
+        in_channels: int = 4,
+        out_channels: int = 4,
+        width: int = 48,
+        member_count: int = 5,
+        tta: bool = True,
+        norm_groups: int = 16,
+        deep_supervision: bool = True,
+    ):
         super().__init__()
-        w = width
+        self.member_count = int(member_count)
+        self.tta = bool(tta)
+        self.members = nn.ModuleList([
+            HenryEquiUNet3D(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                width=width,
+                norm_groups=norm_groups,
+                deep_supervision=deep_supervision,
+                activation_checkpointing=False,
+            )
+            for _ in range(self.member_count)
+        ])
 
-        self.enc1 = EquiBlock(in_channels, w)
-        self.enc2 = EquiBlock(w,    w*2)
-        self.enc3 = EquiBlock(w*2,  w*4)
-        self.enc4 = EquiBlock(w*4,  w*8)
-        self.bot  = EquiBlock(w*8, w*16)
-        self.pool = nn.MaxPool3d(2)
+    def load_member_state_dicts(self, states):
+        if len(states) != len(self.members):
+            raise ValueError(
+                f"Checkpoint has {len(states)} members, expected {len(self.members)}."
+            )
+        for member, state in zip(self.members, states):
+            member.load_state_dict(state)
 
-        self.up4  = nn.ConvTranspose3d(w*16, w*8, 2, stride=2)
-        self.dec4 = EquiBlock(w*16, w*8)
-        self.up3  = nn.ConvTranspose3d(w*8,  w*4, 2, stride=2)
-        self.dec3 = EquiBlock(w*8,  w*4)
-        self.up2  = nn.ConvTranspose3d(w*4,  w*2, 2, stride=2)
-        self.dec2 = EquiBlock(w*4,  w*2)
-        self.up1  = nn.ConvTranspose3d(w*2,  w,   2, stride=2)
-        self.dec1 = EquiBlock(w*2,  w)
-        self.head = nn.Conv3d(w, out_channels, 1)
+    def forward(self, x: torch.Tensor):
+        total = None
+        count = 0
+        specs = _deepensemble_tta_spec() if self.tta else [(None, 0)]
 
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        e4 = self.enc4(self.pool(e3))
-        b  = self.bot(self.pool(e4))
+        for member in self.members:
+            member.eval()
+            for flip, rot in specs:
+                tx = _apply_deepensemble_tta(x, flip, rot)
+                logits = member(tx)
+                probs = torch.softmax(logits, dim=1)
+                probs = _revert_deepensemble_tta(probs, flip, rot)
+                total = probs if total is None else total + probs
+                count += 1
 
-        d4 = self.dec4(torch.cat([self.up4(b),  e4], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.head(d1)
+        mean_probs = total / float(max(1, count))
+        return torch.log(mean_probs.clamp_min(1e-7))
+
+
+def _deep_supervised_output_and_loss(
+    pred,
+    label,
+    criterion,
+    checkpoint_losses: bool = True,
+):
+    """
+    Return main logits and the unweighted main + four auxiliary losses.
+
+    Auxiliary predictions are upsampled one at a time. During training, the
+    criterion calculations can also be checkpointed so the large Dice/CE
+    intermediates are recomputed during backward rather than kept in VRAM.
+    The loss definition and numerical forward values are unchanged.
+    """
+    if not (
+        isinstance(pred, tuple)
+        and len(pred) == 2
+        and isinstance(pred[1], (list, tuple))
+    ):
+        return pred, criterion(pred, label)
+
+    main, aux_native = pred
+
+    def _main_loss(logits, target):
+        return criterion(logits, target)
+
+    if checkpoint_losses and torch.is_grad_enabled():
+        loss = checkpoint(_main_loss, main, label, use_reentrant=False)
+    else:
+        loss = criterion(main, label)
+
+    for aux_logits_native in aux_native:
+        def _aux_loss(aux_logits, target):
+            # Segmentation targets are stored as (B, 1, H, W, D), whereas
+            # auxiliary logits are (B, C, h, w, d).  F.interpolate expects
+            # only the three spatial output dimensions, so always take the
+            # final three target dimensions rather than target.shape[1:].
+            target_spatial = tuple(target.shape[-3:])
+            if tuple(aux_logits.shape[2:]) != target_spatial:
+                aux_logits = F.interpolate(
+                    aux_logits,
+                    size=target_spatial,
+                    mode="trilinear",
+                    align_corners=True,
+                )
+            return criterion(aux_logits, target)
+
+        if checkpoint_losses and torch.is_grad_enabled():
+            aux_loss = checkpoint(
+                _aux_loss, aux_logits_native, label, use_reentrant=False
+            )
+        else:
+            aux_loss = _aux_loss(aux_logits_native, label)
+
+        loss = loss + aux_loss
+
+    return main, loss
 
 
 # ── 4. Diff-UNet  (ge-xing/Diff-UNet, PyTorch) ──────────────────────────────
 
 class SinusoidalTimeEmbedding(nn.Module):
-    """Sinusoidal positional encoding for diffusion timestep t."""
-    def __init__(self, dim: int):
+    """Sinusoidal timestep embedding used by the diffusion denoiser."""
+    def __init__(self, dim: int = 128):
         super().__init__()
-        self.dim = dim
+        self.dim = int(dim)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim != 1:
+            t = t.reshape(-1)
         half = self.dim // 2
-        freqs = torch.exp(-np.log(10000) * torch.arange(half, device=t.device) / (half - 1))
-        args  = t[:, None].float() * freqs[None]
-        return torch.cat([args.sin(), args.cos()], dim=-1)
+        if half < 2:
+            raise ValueError("Diffusion timestep embedding dimension must be >= 4.")
+        scale = np.log(10000.0) / float(half - 1)
+        freqs = torch.exp(
+            torch.arange(half, device=t.device, dtype=torch.float32) * (-scale)
+        )
+        emb = t.float()[:, None] * freqs[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=1)
+        if self.dim % 2:
+            emb = F.pad(emb, (0, 1))
+        return emb
 
 
-class TimeCondConv(nn.Module):
-    def __init__(self, in_c, out_c, t_dim):
+def _diff_norm(channels: int) -> nn.Module:
+    """Instance normalisation used by the published Diff-UNet building blocks."""
+    return nn.InstanceNorm3d(channels, affine=True)
+
+
+class DiffTwoConv(nn.Module):
+    """Two 3-D convolutions with InstanceNorm and LeakyReLU."""
+    def __init__(self, in_c: int, out_c: int):
         super().__init__()
-        self.conv  = ConvBnRelu(in_c, out_c)
-        self.scale = nn.Linear(t_dim, out_c)
-        self.shift = nn.Linear(t_dim, out_c)
+        self.conv1 = nn.Conv3d(in_c, out_c, 3, padding=1, bias=True)
+        self.norm1 = _diff_norm(out_c)
+        self.act1 = nn.LeakyReLU(negative_slope=0.1, inplace=False)
+        self.conv2 = nn.Conv3d(out_c, out_c, 3, padding=1, bias=True)
+        self.norm2 = _diff_norm(out_c)
+        self.act2 = nn.LeakyReLU(negative_slope=0.1, inplace=False)
 
-    def forward(self, x, t_emb):
-        h = self.conv(x)
-        s = self.scale(t_emb)[:, :, None, None, None]
-        b = self.shift(t_emb)[:, :, None, None, None]
-        return h * (1 + s) + b
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act1(self.norm1(self.conv1(x)))
+        x = self.act2(self.norm2(self.conv2(x)))
+        return x
+
+
+class DiffTimeTwoConv(nn.Module):
+    """Diff-UNet two-convolution block with additive timestep conditioning."""
+    def __init__(self, in_c: int, out_c: int, time_dim: int = 512):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_c, out_c, 3, padding=1, bias=True)
+        self.norm1 = _diff_norm(out_c)
+        self.act1 = nn.LeakyReLU(negative_slope=0.1, inplace=False)
+        self.time_proj = nn.Linear(time_dim, out_c)
+        self.conv2 = nn.Conv3d(out_c, out_c, 3, padding=1, bias=True)
+        self.norm2 = _diff_norm(out_c)
+        self.act2 = nn.LeakyReLU(negative_slope=0.1, inplace=False)
+
+    def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
+        x = self.act1(self.norm1(self.conv1(x)))
+        x = x + self.time_proj(F.silu(temb))[:, :, None, None, None]
+        x = self.act2(self.norm2(self.conv2(x)))
+        return x
+
+
+class DiffImageEncoder(nn.Module):
+    """
+    Separate multiscale MRI encoder used to condition the diffusion denoiser.
+
+    This mirrors the image-embedding branch in the reference BraTS2020
+    Diff-UNet implementation. The common pipeline base-filter setting controls
+    its width so the architecture can still be compared under the same
+    full-volume experimental protocol.
+    """
+    def __init__(self, in_channels: int = 4, base_filters: int = 32):
+        super().__init__()
+        f = int(base_filters)
+        self.pool = nn.MaxPool3d(2)
+        self.enc0 = DiffTwoConv(in_channels, f)
+        self.enc1 = DiffTwoConv(f, f)
+        self.enc2 = DiffTwoConv(f, f * 2)
+        self.enc3 = DiffTwoConv(f * 2, f * 4)
+        self.enc4 = DiffTwoConv(f * 4, f * 8)
+
+    def forward(self, image: torch.Tensor) -> List[torch.Tensor]:
+        x0 = self.enc0(image)
+        x1 = self.enc1(self.pool(x0))
+        x2 = self.enc2(self.pool(x1))
+        x3 = self.enc3(self.pool(x2))
+        x4 = self.enc4(self.pool(x3))
+        return [x0, x1, x2, x3, x4]
+
+
+class DiffDenoiser3D(nn.Module):
+    """
+    Time-conditioned U-Net denoiser with additive multiscale MRI embeddings.
+
+    The noisy segmentation state and MRI modalities are concatenated at the
+    denoiser input, while the separate image encoder contributes features at
+    each encoder resolution, matching the conditioning pattern of Diff-UNet.
+    """
+    def __init__(self, image_channels: int, seg_channels: int,
+                 base_filters: int = 32, t_embed_dim: int = 128,
+                 time_dim: int = 512):
+        super().__init__()
+        f = int(base_filters)
+        self.pool = nn.MaxPool3d(2)
+
+        self.time_embedding = SinusoidalTimeEmbedding(t_embed_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(t_embed_dim, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, time_dim),
+        )
+
+        self.enc0 = DiffTimeTwoConv(image_channels + seg_channels, f, time_dim)
+        self.enc1 = DiffTimeTwoConv(f, f, time_dim)
+        self.enc2 = DiffTimeTwoConv(f, f * 2, time_dim)
+        self.enc3 = DiffTimeTwoConv(f * 2, f * 4, time_dim)
+        self.enc4 = DiffTimeTwoConv(f * 4, f * 8, time_dim)
+
+        self.up4 = nn.ConvTranspose3d(f * 8, f * 4, 2, stride=2)
+        self.dec4 = DiffTimeTwoConv(f * 8, f * 4, time_dim)
+        self.up3 = nn.ConvTranspose3d(f * 4, f * 2, 2, stride=2)
+        self.dec3 = DiffTimeTwoConv(f * 4, f * 2, time_dim)
+        self.up2 = nn.ConvTranspose3d(f * 2, f, 2, stride=2)
+        self.dec2 = DiffTimeTwoConv(f * 2, f, time_dim)
+        # The final upsampling keeps f channels, as in the reference BasicUNetDe.
+        self.up1 = nn.ConvTranspose3d(f, f, 2, stride=2)
+        self.dec1 = DiffTimeTwoConv(f * 2, f, time_dim)
+        self.head = nn.Conv3d(f, seg_channels, 1)
+
+    @staticmethod
+    def _match_shape(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """Pad/crop a decoder tensor to exactly match its skip connection."""
+        target = ref.shape[2:]
+        if x.shape[2:] == target:
+            return x
+        # Interpolation is only a shape safeguard for odd pooled dimensions.
+        return F.interpolate(x, size=target, mode="trilinear", align_corners=False)
+
+    def forward(self, xt: torch.Tensor, image: torch.Tensor, t: torch.Tensor,
+                embeddings: List[torch.Tensor]) -> torch.Tensor:
+        temb = self.time_mlp(self.time_embedding(t))
+        x = torch.cat([image, xt], dim=1)
+
+        x0 = self.enc0(x, temb) + embeddings[0]
+        x1 = self.enc1(self.pool(x0), temb) + embeddings[1]
+        x2 = self.enc2(self.pool(x1), temb) + embeddings[2]
+        x3 = self.enc3(self.pool(x2), temb) + embeddings[3]
+        x4 = self.enc4(self.pool(x3), temb) + embeddings[4]
+
+        u4 = self._match_shape(self.up4(x4), x3)
+        u4 = self.dec4(torch.cat([x3, u4], dim=1), temb)
+        u3 = self._match_shape(self.up3(u4), x2)
+        u3 = self.dec3(torch.cat([x2, u3], dim=1), temb)
+        u2 = self._match_shape(self.up2(u3), x1)
+        u2 = self.dec2(torch.cat([x1, u2], dim=1), temb)
+        u1 = self._match_shape(self.up1(u2), x0)
+        u1 = self.dec1(torch.cat([x0, u1], dim=1), temb)
+        return self.head(u1)
 
 
 class DiffUNet(nn.Module):
     """
-    Diffusion-embedded U-Net (Diff-UNet).
-    Ref: ge-xing/Diff-UNet (MICCAI 2023, https://arxiv.org/pdf/2303.10326)
+    Multi-class adaptation of Diff-UNet for the common BraTS2020 experiment.
 
-    During training: noisy seg map is concatenated with image (in_channels+out_channels)
-                     and denoised at a random timestep.
-    During inference: iterative DDIM-style denoising from Gaussian noise.
+    Reference implementation: ge-xing/Diff-UNet, BraTS2020 branch.
+
+    Key diffusion behaviour retained from Diff-UNet:
+      * a separate 3-D MRI encoder supplies multiscale image embeddings;
+      * the segmentation itself is diffused over T=1000 timesteps;
+      * the denoiser uses START_X parameterisation, predicting the clean
+        segmentation state rather than diffusion noise;
+      * inference uses deterministic DDIM-style sampling with 50 timesteps.
+
+    Adaptations required by the common experiment:
+      * four mutually exclusive classes are used instead of three overlapping
+        WT/TC/ET channels;
+      * the denoiser emits four class logits and is optimised with the same
+        0.5 Dice + 0.5 categorical cross-entropy loss as every other model;
+      * full 240x240x160 inputs are retained rather than 96x96x96 training crops.
+
+    For diffusion, the one-hot segmentation is mapped from {0,1} to [-1,1].
+    Predicted class logits are converted back to the same diffusion state via
+    x0 = 2*softmax(logits)-1 for each DDIM update.
     """
-    def __init__(self, in_channels: int = 4, out_channels: int = 3,
-                 base_filters: int = 32, T: int = 1000, t_dim: int = 64):
+    def __init__(self, in_channels: int = 4, out_channels: int = 4,
+                 base_filters: int = 32, T: int = 1000,
+                 infer_steps: int = 50):
         super().__init__()
-        f = base_filters
-        self.T     = T
-        self.t_emb = SinusoidalTimeEmbedding(t_dim)
+        self.T = int(T)
+        self.infer_steps = int(infer_steps)
+        self.out_channels = int(out_channels)
 
-        # The network sees (image + noisy_seg) concatenated
-        cin = in_channels + out_channels
+        self.embed_model = DiffImageEncoder(in_channels, base_filters)
+        self.model = DiffDenoiser3D(
+            image_channels=in_channels,
+            seg_channels=out_channels,
+            base_filters=base_filters,
+        )
 
-        self.enc1 = TimeCondConv(cin,   f,    t_dim)
-        self.enc2 = TimeCondConv(f,    f*2,   t_dim)
-        self.enc3 = TimeCondConv(f*2,  f*4,   t_dim)
-        self.enc4 = TimeCondConv(f*4,  f*8,   t_dim)
-        self.bot  = TimeCondConv(f*8,  f*16,  t_dim)
-        self.pool = nn.MaxPool3d(2)
+        # Linear DDPM schedule used by the reference implementation at T=1000.
+        betas = torch.linspace(1e-4, 0.02, self.T, dtype=torch.float32)
+        alphas = 1.0 - betas
+        alpha_bar = torch.cumprod(alphas, dim=0)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alpha_bar", alpha_bar)
+        self.register_buffer("sqrt_abar", torch.sqrt(alpha_bar))
+        self.register_buffer("sqrt_1mabar", torch.sqrt(1.0 - alpha_bar))
 
-        self.up4  = nn.ConvTranspose3d(f*16, f*8, 2, stride=2)
-        self.dec4 = TimeCondConv(f*16, f*8, t_dim)
-        self.up3  = nn.ConvTranspose3d(f*8,  f*4, 2, stride=2)
-        self.dec3 = TimeCondConv(f*8,  f*4, t_dim)
-        self.up2  = nn.ConvTranspose3d(f*4,  f*2, 2, stride=2)
-        self.dec2 = TimeCondConv(f*4,  f*2, t_dim)
-        self.up1  = nn.ConvTranspose3d(f*2,  f,   2, stride=2)
-        self.dec1 = TimeCondConv(f*2,  f,   t_dim)
-        self.head = nn.Conv3d(f, out_channels, 1)
+    def _target_to_x0(self, target: torch.Tensor) -> torch.Tensor:
+        """Convert integer class labels to a four-channel diffusion state in [-1,1]."""
+        if target.dim() == 5 and target.shape[1] == 1:
+            target = target[:, 0]
+        if target.dim() != 4:
+            raise ValueError(
+                f"Diff-UNet target must be (B,D,H,W) or (B,1,D,H,W); got {tuple(target.shape)}"
+            )
+        one_hot = F.one_hot(target.long(), self.out_channels).movedim(-1, 1).float()
+        return one_hot.mul(2.0).sub(1.0)
 
-        # DDPM noise schedule
-        betas      = torch.linspace(1e-4, 0.02, T)
-        alphas     = 1.0 - betas
-        alpha_bar  = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas",      betas)
-        self.register_buffer("alpha_bar",  alpha_bar)
-        self.register_buffer("sqrt_abar",  alpha_bar.sqrt())
-        self.register_buffer("sqrt_1mabar",(1 - alpha_bar).sqrt())
-
-    # ── diffusion helpers ──────────────────────────────────────
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward noising: q(x_t | x_0)."""
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Forward diffusion q(x_t | x_0)."""
         noise = torch.randn_like(x0)
-        sa  = self.sqrt_abar[t][:, None, None, None, None]
+        sa = self.sqrt_abar[t][:, None, None, None, None]
         sma = self.sqrt_1mabar[t][:, None, None, None, None]
-        return sa * x0 + sma * noise, noise
+        return sa * x0 + sma * noise
 
-    def _unet(self, xt: torch.Tensor, image: torch.Tensor, t: torch.Tensor):
-        """Single U-Net forward (image + noisy seg -> predicted noise)."""
-        t_emb = self.t_emb(t)
-        x = torch.cat([image, xt], dim=1)
-        e1 = self.enc1(x,  t_emb)
-        e2 = self.enc2(self.pool(e1), t_emb)
-        e3 = self.enc3(self.pool(e2), t_emb)
-        e4 = self.enc4(self.pool(e3), t_emb)
-        b  = self.bot (self.pool(e4), t_emb)
-        d4 = self.dec4(torch.cat([self.up4(b),  e4], dim=1), t_emb)
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1), t_emb)
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1), t_emb)
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1), t_emb)
-        return self.head(d1)
+    def _predict_logits(self, xt: torch.Tensor, image: torch.Tensor,
+                        t: torch.Tensor,
+                        embeddings: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        if embeddings is None:
+            embeddings = self.embed_model(image)
+        return self.model(xt, image, t, embeddings)
 
     def forward(self, image: torch.Tensor,
-                seg: Optional[torch.Tensor] = None,
-                t: Optional[torch.Tensor]   = None):
+                target: Optional[torch.Tensor] = None,
+                t: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Training: supply seg + random t -> returns predicted noise.
-        Inference: seg=None, t=None  -> returns denoised logits via DDIM.
-        """
-        if self.training and seg is not None:
-            if t is None:
-                t = torch.randint(0, self.T, (image.size(0),), device=image.device)
-            xt, noise = self.q_sample(seg, t)
-            return self._unet(xt, image, t), noise
+        Training: ``model(image, target)`` returns predicted clean-segmentation
+        logits at a randomly sampled diffusion timestep.
 
-        # ── inference: DDIM with 10 steps ──
-        return self._ddim_sample(image, steps=10)
+        Evaluation: ``model(image)`` runs 50-step deterministic DDIM sampling
+        and returns final four-class logits for the common argmax evaluation.
+        """
+        if target is not None:
+            if t is None:
+                t = torch.randint(0, self.T, (image.shape[0],), device=image.device)
+            x0 = self._target_to_x0(target)
+            xt = self.q_sample(x0, t)
+            embeddings = self.embed_model(image)
+            return self._predict_logits(xt, image, t, embeddings)
+
+        return self._ddim_sample(image, steps=self.infer_steps)
 
     @torch.no_grad()
-    def _ddim_sample(self, image: torch.Tensor, steps: int = 10) -> torch.Tensor:
-        B   = image.size(0)
-        dev = image.device
-        xt  = torch.randn(B, self.head.out_channels, *image.shape[2:], device=dev)
+    def _ddim_sample(self, image: torch.Tensor, steps: Optional[int] = None) -> torch.Tensor:
+        """
+        Deterministic START_X DDIM-style sampling.
 
-        step_indices = torch.linspace(self.T - 1, 0, steps, dtype=torch.long, device=dev)
+        The denoiser predicts class logits. Softmax converts those logits to
+        class probabilities, which are mapped to [-1,1] to obtain the clean
+        diffusion state x_0 used in the DDIM update.
+        """
+        steps = int(self.infer_steps if steps is None else steps)
+        if steps < 1:
+            raise ValueError("Diff-UNet inference requires at least one DDIM step.")
+
+        B = image.shape[0]
+        dev = image.device
+        embeddings = self.embed_model(image)
+        xt = torch.randn(
+            B, self.out_channels, *image.shape[2:],
+            device=dev, dtype=image.dtype,
+        )
+
+        # Equivalent to the evenly spaced 50-step respacing used by the
+        # reference BraTS2020 implementation when T=1000.
+        step_indices = torch.linspace(
+            self.T - 1, 0, steps, device=dev, dtype=torch.float32
+        ).round().long()
+
+        final_logits = None
+        eps = 1e-8
         for i, ti in enumerate(step_indices):
             t_batch = ti.expand(B)
-            eps     = self._unet(xt, image, t_batch)
-            sa      = self.sqrt_abar[ti]
-            sma     = self.sqrt_1mabar[ti]
-            x0_pred = (xt - sma * eps) / (sa + 1e-8)
-            if i < steps - 1:
-                ti_prev = step_indices[i + 1]
-                sa_prev = self.sqrt_abar[ti_prev]
-                xt = sa_prev * x0_pred + self.sqrt_1mabar[ti_prev] * eps
-            else:
-                xt = x0_pred
-        return xt
+            logits = self._predict_logits(xt, image, t_batch, embeddings)
+            final_logits = logits
+
+            # START_X prediction in the diffusion state space.
+            x0_pred = torch.softmax(logits.float(), dim=1)
+            x0_pred = x0_pred.mul(2.0).sub(1.0).to(dtype=xt.dtype)
+
+            if i == len(step_indices) - 1:
+                break
+
+            abar_t = self.alpha_bar[ti].to(dtype=xt.dtype)
+            ti_prev = step_indices[i + 1]
+            abar_prev = self.alpha_bar[ti_prev].to(dtype=xt.dtype)
+
+            # Recover epsilon from x_t and the predicted x_0, then perform the
+            # deterministic eta=0 DDIM update to the previous respaced step.
+            eps_pred = (xt - torch.sqrt(abar_t) * x0_pred) / (
+                torch.sqrt(1.0 - abar_t) + eps
+            )
+            xt = (
+                torch.sqrt(abar_prev) * x0_pred
+                + torch.sqrt(1.0 - abar_prev) * eps_pred
+            )
+
+        if final_logits is None:
+            raise RuntimeError("Diff-UNet DDIM sampler produced no prediction.")
+        return final_logits
 
 
 # ── 5. HVU 2D / DenseVU-ED ──────────────────────────────────────────────────
@@ -2854,80 +3350,148 @@ class HVUNet(nn.Module):
         return out
 
 
-# ── 6. Simple 2D UNet ────────────────────────────────────────────────────────
+# ── 6. Corrected 2D U-Net ────────────────────────────────────────────────────
 
-class ConvBnRelu2D(nn.Sequential):
-    """2-D counterpart of ConvBnRelu used by UNet2D."""
-    def __init__(self, in_c, out_c, kernel=3, stride=1, padding=1):
-        super().__init__(
-            nn.Conv2d(in_c, out_c, kernel, stride=stride, padding=padding, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True),
+class ConvNormRelu2D(nn.Module):
+    """
+    3x3 convolution + GroupNorm + ReLU.
+
+    GroupNorm is used instead of BatchNorm so optimisation is not tied to
+    slice-batch composition or to adjacent slices from the same patient.
+    """
+    def __init__(
+        self,
+        in_c: int,
+        out_c: int,
+        groups: int = 8,
+        kernel: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+    ):
+        super().__init__()
+        g = min(int(groups), int(out_c))
+        while g > 1 and out_c % g != 0:
+            g -= 1
+        self.conv = nn.Conv2d(
+            in_c, out_c, kernel_size=kernel, stride=stride,
+            padding=padding, bias=False
         )
+        self.norm = nn.GroupNorm(g, out_c)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
 
 
 class UNet2D(nn.Module):
     """
-    Classic 2-D U-Net (Ronneberger et al., 2015).
+    Padded 2-D U-Net baseline based on Ronneberger et al. (2015).
 
-    Operates on individual axial slices: input  (B, 4, H, W)
-                                         output (B, num_classes, H, W)
+    Input:  (B, 4, 240, 240)
+    Output: (B, 4, 240, 240)
 
-    Encoder depth: 4 levels with MaxPool2d(2).
-    Decoder uses bilinear upsampling (no checkerboard artefacts) followed
-    by a double-conv block, and skip connections at every level.
+    The encoder uses four pooling stages and doubles channels after each stage.
+    The decoder uses learned 2x2 transposed convolutions to halve channel count
+    before concatenation with the corresponding encoder feature map, followed
+    by two 3x3 convolutions.
 
-    Compared to the 3-D models this is much lighter (~1 M params at
-    base_filters=32) and trains well on a single consumer GPU.
+    The base width remains 32 to preserve the approximately 7.8 M parameter
+    scale used by the existing benchmark. This is intentionally not widened
+    to the original paper's 64-channel base because that would increase the
+    model to roughly 31 M parameters and materially change the efficiency
+    comparison.
     """
 
-    def __init__(self, in_channels: int = 4, out_channels: int = 3,
-                 base_filters: int = 32):
+    def __init__(
+        self,
+        in_channels: int = 4,
+        out_channels: int = 4,
+        base_filters: int = 32,
+        norm_groups: int = 8,
+    ):
         super().__init__()
-        f = base_filters
+        f = int(base_filters)
+        g = int(norm_groups)
 
         def double_conv(ic, oc):
-            return nn.Sequential(ConvBnRelu2D(ic, oc), ConvBnRelu2D(oc, oc))
+            return nn.Sequential(
+                ConvNormRelu2D(ic, oc, groups=g),
+                ConvNormRelu2D(oc, oc, groups=g),
+            )
 
-        # ── encoder ──────────────────────────────────────────────────────────
-        self.enc1 = double_conv(in_channels, f)       #  f   x H   x W
-        self.enc2 = double_conv(f,    f * 2)           #  2f  x H/2 x W/2
-        self.enc3 = double_conv(f*2,  f * 4)           #  4f  x H/4 x W/4
-        self.enc4 = double_conv(f*4,  f * 8)           #  8f  x H/8 x W/8
-        self.pool = nn.MaxPool2d(2)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # ── bottleneck ───────────────────────────────────────────────────────
-        self.bottleneck = double_conv(f*8, f * 16)     # 16f  x H/16 x W/16
+        # Encoder
+        self.enc1 = double_conv(in_channels, f)
+        self.enc2 = double_conv(f, f * 2)
+        self.enc3 = double_conv(f * 2, f * 4)
+        self.enc4 = double_conv(f * 4, f * 8)
 
-        # ── decoder (bilinear up + double-conv) ──────────────────────────────
-        self.up4   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.dec4  = double_conv(f*16 + f*8,  f * 8)
+        # Bottleneck
+        self.bottleneck = double_conv(f * 8, f * 16)
 
-        self.up3   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.dec3  = double_conv(f*8  + f*4,  f * 4)
+        # Canonical learned up-convolutions halve channels before skip concat.
+        self.up4 = nn.ConvTranspose2d(f * 16, f * 8, kernel_size=2, stride=2)
+        self.dec4 = double_conv(f * 16, f * 8)
 
-        self.up2   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.dec2  = double_conv(f*4  + f*2,  f * 2)
+        self.up3 = nn.ConvTranspose2d(f * 8, f * 4, kernel_size=2, stride=2)
+        self.dec3 = double_conv(f * 8, f * 4)
 
-        self.up1   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.dec1  = double_conv(f*2  + f,    f)
+        self.up2 = nn.ConvTranspose2d(f * 4, f * 2, kernel_size=2, stride=2)
+        self.dec2 = double_conv(f * 4, f * 2)
 
-        # ── 1x1 output projection ─────────────────────────────────────────────
-        self.head  = nn.Conv2d(f, out_channels, kernel_size=1)
+        self.up1 = nn.ConvTranspose2d(f * 2, f, kernel_size=2, stride=2)
+        self.dec1 = double_conv(f * 2, f)
+
+        self.head = nn.Conv2d(f, out_channels, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _match(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        # 240x240 is exactly divisible by 16, so normally no resize is needed.
+        # Keep this guard for robustness if a different input geometry is used.
+        if x.shape[-2:] != ref.shape[-2:]:
+            x = F.interpolate(
+                x, size=ref.shape[-2:], mode="bilinear", align_corners=False
+            )
+        return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 4, H, W)
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
-        b  = self.bottleneck(self.pool(e4))
 
-        d4 = self.dec4(torch.cat([self.up4(b),  e4], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.head(d1)          # (B, num_classes, H, W)
+        b = self.bottleneck(self.pool(e4))
+
+        u4 = self._match(self.up4(b), e4)
+        d4 = self.dec4(torch.cat([u4, e4], dim=1))
+
+        u3 = self._match(self.up3(d4), e3)
+        d3 = self.dec3(torch.cat([u3, e3], dim=1))
+
+        u2 = self._match(self.up2(d3), e2)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1))
+
+        u1 = self._match(self.up1(d2), e1)
+        d1 = self.dec1(torch.cat([u1, e1], dim=1))
+
+        return self.head(d1)
 
 
 # ---- 7. DeepLabV3+ 2D --------------------------------------------------------
@@ -3322,11 +3886,36 @@ def build_model(cfg: dict) -> nn.Module:
         out_channels=cfg["num_classes"],       # one logit per class (incl. background) for softmax
         base_filters=cfg["base_filters"],
     )
+    if name == "unet2d":
+        kwargs["norm_groups"] = int(cfg.get("unet2d_norm_groups", 8))
     if name == "diff_unet":
         kwargs["T"] = cfg["diffusion_steps"]
+        kwargs["infer_steps"] = cfg.get("diffusion_infer_steps", 50)
     if name == "deepensemble":
         kwargs.pop("base_filters")
-        kwargs["width"] = cfg["base_filters"]
+        width = int(cfg.get("deepensemble_width", 48))
+        norm_groups = int(cfg.get("deepensemble_norm_groups", 16))
+        deep_sup = bool(cfg.get("deepensemble_deep_supervision", True))
+        if cfg.get("_deepensemble_training_member", False):
+            return HenryEquiUNet3D(
+                in_channels=cfg["in_channels"],
+                out_channels=cfg["num_classes"],
+                width=width,
+                norm_groups=norm_groups,
+                deep_supervision=deep_sup,
+                activation_checkpointing=bool(
+                    cfg.get("deepensemble_activation_checkpointing", True)
+                ),
+            )
+        return DeepEnsemble3D(
+            in_channels=cfg["in_channels"],
+            out_channels=cfg["num_classes"],
+            width=width,
+            member_count=int(cfg.get("deepensemble_members", 5)),
+            tta=bool(cfg.get("deepensemble_tta", True)),
+            norm_groups=norm_groups,
+            deep_supervision=deep_sup,
+        )
     # UNet2D uses 2-D convolutions - no extra kwargs needed
     return MODEL_REGISTRY[name](**kwargs)
 
@@ -3399,10 +3988,22 @@ class Trainer:
             logger.info("2-D mode: building per-slice datasets (axial slices)")
             _slice_setup_t0 = time.perf_counter()
             logger.info("Building training slice index...")
+            unet2d_skip_empty = (
+                float(cfg.get("unet2d_skip_empty_ratio", 0.0))
+                if str(cfg.get("model", "")).lower() == "unet2d"
+                else 0.9
+            )
+            if str(cfg.get("model", "")).lower() == "unet2d":
+                logger.info(
+                    "UNet2D training slice policy: retaining all native axial "
+                    f"slices (skip_empty_ratio={unet2d_skip_empty:.1f})."
+                )
+
             self.train_ds = BraTS2020SliceDataset(
                 train_pts, cfg["patch_size"], augment=cfg["augment"],
                 flip_prob=cfg["flip_prob"], affine_prob=cfg["affine_prob"],
                 noise_prob=cfg["noise_prob"], intensity_prob=cfg["intensity_prob"],
+                skip_empty_ratio=unet2d_skip_empty,
                 cache_rate=cache_rate, cache_compress=cfg.get("cache_compress", True),
                 preprocessed_cache_dir=cache_root,
                 mmap_lru_patients=cfg.get("mmap_lru_patients", 32),
@@ -3495,6 +4096,21 @@ class Trainer:
                 "Diff-UNet low-VRAM mode: asynchronous CUDA batch prefetch is disabled. "
                 "Only the current full-volume batch is resident on CUDA; DataLoader "
                 "worker prefetch remains CPU-side."
+            )
+        if cfg.get("model", "").lower() == "deepensemble" and not cuda_prefetch_enabled(cfg):
+            logger.info(
+                "DeepEnsemble member low-VRAM mode: asynchronous CUDA batch prefetch "
+                "is disabled while each paper-style full-volume member is trained."
+            )
+            logger.info(
+                "DeepEnsemble low-VRAM settings: activation checkpointing="
+                f"{bool(cfg.get('deepensemble_activation_checkpointing', True))}, "
+                "checkpointed deep-supervision losses="
+                f"{bool(cfg.get('deepensemble_checkpoint_losses', True))}, "
+                "physical batch cap="
+                f"{int(cfg.get('deepensemble_max_batch_size', 1))}, "
+                "CUDA cache interval="
+                f"{int(cfg.get('deepensemble_empty_cache_interval', 10))} batches."
             )
 
         # ── automatic batch-size selection ──
@@ -3638,6 +4254,25 @@ class Trainer:
         heavy_2d = is2d and cfg.get("model") in {"hvu", "deeplabv3plus2d"}
         max_batch = int(cfg.get("max_batch_size_2d", 4096) if is2d
                         else cfg.get("max_batch_size_3d", 32))
+
+        # The corrected full-volume Diff-UNet can terminate the Windows process
+        # at native CUDA/WDDM level when probing batch 2, before PyTorch can
+        # raise a catchable CUDA OOM. Keep its physical batch ceiling at 1 by
+        # default. This does not change the model architecture or per-batch math.
+        if cfg.get("model") == "unet2d":
+            # Do not let the small U-Net expand to an enormous physical batch.
+            # With a fixed 1e-4 LR, batches around 200-300 substantially reduce
+            # optimiser updates per epoch and can undertrain minority tumour
+            # classes. Keep the common study LR and cap the physical batch at 64.
+            unet2d_cap = max(1, int(cfg.get("unet2d_max_batch_size", 64)))
+            max_batch = min(max_batch, unet2d_cap)
+        elif cfg.get("model") == "diff_unet":
+            diff_cap = max(1, int(cfg.get("diff_unet_max_batch_size", 1)))
+            max_batch = min(max_batch, diff_cap)
+        elif cfg.get("model") == "deepensemble":
+            ensemble_cap = max(1, int(cfg.get("deepensemble_max_batch_size", 1)))
+            max_batch = min(max_batch, ensemble_cap)
+
         max_batch = max(1, min(max_batch, len(self.train_ds)))
         start_batch = max(1, min(int(requested_batch), max_batch))
         step = max(1, int(cfg.get("batch_size_step", 16))) if is2d else 1
@@ -3647,6 +4282,27 @@ class Trainer:
         target_bytes = int(total_bytes * target_fraction)
         min_free = int(float(cfg.get("batch_vram_headroom_gb", 1.0)) * 1024**3)
 
+        # Only Diff-UNet changed architecture/training memory behaviour in the
+        # START_X correction. Preserve authoritative cached batch sizes for the
+        # other six models while forcing Diff-UNet to obtain a fresh value.
+        diff_revision = (
+            f"|unet2d_v3|gn{int(cfg.get('unet2d_norm_groups', 8))}"
+            f"|cap{int(cfg.get('unet2d_max_batch_size', 64))}"
+            f"|emptydrop{float(cfg.get('unet2d_skip_empty_ratio', 0.0)):.3f}"
+            if cfg.get("model") == "unet2d" else ""
+        )
+        if cfg.get("model") == "diff_unet":
+            diff_revision += (
+                f"|diffstartx3|dcap{int(cfg.get('diff_unet_max_batch_size', 1))}"
+            )
+        if cfg.get("model") == "deepensemble":
+            diff_revision += (
+                f"|henrydeepsup3|w{int(cfg.get('deepensemble_width', 48))}"
+                f"|g{int(cfg.get('deepensemble_norm_groups', 16))}"
+                f"|ckpt{int(bool(cfg.get('deepensemble_activation_checkpointing', True)))}"
+                f"|lossc{int(bool(cfg.get('deepensemble_checkpoint_losses', True)))}"
+                f"|cap{int(cfg.get('deepensemble_max_batch_size', 1))}"
+            )
         runtime_key = (
             f"v{int(cfg.get('autobatch_cache_version', 4))}|"
             f"{cfg.get('model')}|{tuple(cfg.get('patch_size', ())) }|"
@@ -3659,6 +4315,7 @@ class Trainer:
             f"noise{float(cfg.get('noise_prob', 0.2)):.3f}|"
             f"bias{float(cfg.get('intensity_prob', 0.3)):.3f}|"
             f"target{target_fraction:.3f}|head{min_free}|gpu{props.name}|vram{total_bytes}"
+            f"{diff_revision}"
         )
         resolved = cfg.setdefault("_autotuned_batch_sizes", {})
         if runtime_key in resolved:
@@ -3700,10 +4357,17 @@ class Trainer:
             f"VRAM target={target_fraction:.0%} of {total_bytes / 1024**3:.1f} GB; "
             f"minimum free headroom={min_free / 1024**3:.1f} GB."
         )
+        if cfg.get("model") == "unet2d":
+            self.logger.info(
+                "UNet2D optimisation-safe auto-batch mode: physical batch size is "
+                f"capped at {max_batch} so the fixed 1e-4 learning rate is not paired "
+                "with the previous very-large-batch regime."
+            )
         if is_diffusion_model(self.model):
             self.logger.info(
-                "Diff-UNet fast-start tuning: batch search skips repeated worst-case GPU augmentation; "
-                "the selected candidate receives one full augmentation safety check."
+                "Diff-UNet safe auto-batch mode: physical batch size is capped at "
+                f"{max_batch}. Probe 2 will not be launched. Batch 1 still receives "
+                "the real training probe and full-augmentation safety checks."
             )
         if heavy_2d:
             self.logger.info(
@@ -3758,7 +4422,7 @@ class Trainer:
             probe result.  The caller can then fall back to the last known-good
             batch instead of terminating the entire experiment.
             """
-            image = label = pred = loss = next_image = next_label = true_noise = seg = None
+            image = label = pred = loss = next_image = next_label = None
             try:
                 if clear_cache:
                     _safe_cuda_cleanup()
@@ -3781,14 +4445,26 @@ class Trainer:
                 self.model.train()
                 with amp_context(self.device, cfg.get("amp", True)):
                     if is_diffusion_model(self.model):
-                        seg = F.one_hot(
-                            label.long().squeeze(1), cfg["num_classes"]
-                        ).permute(0, 4, 1, 2, 3).float()
-                        pred, true_noise = self.model(image, seg)
-                        loss = F.mse_loss(pred, true_noise)
+                        # Correct Diff-UNet START_X training path. The model
+                        # internally maps the integer class target to a one-hot
+                        # diffusion state in [-1,1] and predicts clean-segmentation
+                        # logits. Optimisation uses the same common Dice + CE
+                        # criterion as the other architectures.
+                        pred = self.model(image, label)
+                        loss = self.criterion(pred, label)
                     else:
                         pred = self.model(image)
-                        loss = self.criterion(pred, label)
+                        if cfg.get("model", "").lower() == "deepensemble":
+                            pred, loss = _deep_supervised_output_and_loss(
+                                pred,
+                                label,
+                                self.criterion,
+                                checkpoint_losses=bool(
+                                    cfg.get("deepensemble_checkpoint_losses", True)
+                                ),
+                            )
+                        else:
+                            loss = self.criterion(pred, label)
 
                 loss.backward()
                 probe_opt.step()
@@ -3823,7 +4499,7 @@ class Trainer:
                     probe_opt.zero_grad(set_to_none=True)
                 except Exception:
                     pass
-                del image, label, pred, loss, next_image, next_label, true_noise, seg
+                del image, label, pred, loss, next_image, next_label
                 if clear_cache:
                     _safe_cuda_cleanup()
 
@@ -3839,6 +4515,10 @@ class Trainer:
         last_good = 0
         first_bad = None
         successful_peaks = {}
+        # True when batch size 1 physically fits but is already above the
+        # preferred VRAM target. In that case there is no valid smaller batch,
+        # so lock the tuner to batch 1 and never probe a larger batch.
+        minimum_batch_locked = False
 
         # Find a valid starting point without expensive augmentation.
         b = start_batch
@@ -3872,10 +4552,12 @@ class Trainer:
             if physically_fit:
                 last_good = 1
                 successful_peaks[1] = int(physical[1])
+                minimum_batch_locked = True
                 self.logger.warning(
                     f"Batch size 1 physically fits but exceeds the preferred "
-                    f"{target_fraction:.0%} VRAM policy. Using batch 1 because "
-                    "no smaller training batch exists."
+                    f"{target_fraction:.0%} VRAM policy. Locking batch size 1 "
+                    "because no smaller training batch exists; no larger batch "
+                    "probes will be attempted."
                 )
             else:
                 base_model.load_state_dict(initial_state)
@@ -3894,7 +4576,7 @@ class Trainer:
         # push Windows/WDDM into shared-GPU-memory thrashing rather than raising
         # a clean CUDA OOM.
         b = last_good
-        while b < max_batch:
+        while (not minimum_batch_locked) and b < max_batch:
             if is2d and not heavy_2d:
                 candidate = min(max_batch, b * 2)
             elif heavy_2d:
@@ -3999,55 +4681,96 @@ class Trainer:
 
                 candidate = max(1, candidate - step)
 
-        # Repeated stability check. A candidate must remain within the VRAM
-        # policy for consecutive real augmented training steps without relying
-        # on torch.cuda.empty_cache() between steps. This catches allocator /
-        # WDDM pressure that a one-off probe can miss.
+        # Repeated memory-stability check. A candidate must complete several
+        # consecutive real augmented training steps without relying on
+        # torch.cuda.empty_cache() between steps. Batch selection is based only
+        # on CUDA memory safety, never on wall-clock timing variation.
+        #
+        # Timing is deliberately diagnostic only. CUDA kernel warm-up,
+        # activation-checkpoint recomputation, Windows/WDDM scheduling, clock
+        # changes and allocator behaviour can make consecutive step times vary
+        # substantially even when the batch is completely safe.
         stability_steps = max(1, int(cfg.get("autobatch_stability_steps", 3)))
-        stability_limit = float(cfg.get("autobatch_stability_slowdown", 1.50))
         if stability_steps > 1 and self.gpu_augmenter is not None:
             candidate = int(last_good)
             while candidate >= 1:
                 self.logger.info(
-                    f"Auto batch: stability testing batch {candidate} for "
+                    f"Auto batch: memory-stability testing batch {candidate} for "
                     f"{stability_steps} consecutive full-augmentation steps..."
                 )
                 torch.cuda.empty_cache()
                 times = []
                 stable = True
+
                 for rep in range(stability_steps):
                     t_rep = time.perf_counter()
-                    result = probe(candidate, include_augmentation=True, clear_cache=False)
+                    result = probe(
+                        candidate,
+                        include_augmentation=True,
+                        clear_cache=False,
+                    )
                     dt_rep = time.perf_counter() - t_rep
                     times.append(dt_rep)
-                    log_probe(candidate, result, suffix=f" [stability {rep+1}/{stability_steps}]")
+
+                    log_probe(
+                        candidate,
+                        result,
+                        suffix=f" [memory stability {rep+1}/{stability_steps}]",
+                    )
+
+                    # probe()[0] already requires:
+                    #   1. the real forward/backward/optimiser step completed,
+                    #   2. peak reserved VRAM stayed within the target, and
+                    #   3. the configured minimum free-VRAM headroom remained.
+                    # Any CUDA OOM is also converted to result[0] == False.
                     if not result[0]:
                         stable = False
                         break
+
                 torch.cuda.empty_cache()
 
                 if stable:
-                    fastest = max(min(times), 1e-9)
-                    slowdown = max(times) / fastest
-                    if slowdown <= stability_limit:
-                        last_good = candidate
-                        self.logger.info(
-                            f"Auto batch stability passed at {candidate}: "
-                            f"step times={[round(x, 2) for x in times]} s."
-                        )
-                        break
-                    self.logger.warning(
-                        f"Auto batch {candidate} showed unstable repeated-step time "
-                        f"({slowdown:.2f}x spread); backing off."
-                    )
-
-                if candidate == 1:
-                    last_good = 1
-                    self.logger.warning(
-                        "Batch size 1 is the minimum possible size; using it despite "
-                        "the stability warning."
+                    last_good = candidate
+                    self.logger.info(
+                        f"Auto batch memory stability passed at {candidate}: "
+                        f"{stability_steps} consecutive augmented steps completed "
+                        "within the CUDA memory policy. "
+                        f"Diagnostic step times={[round(x, 2) for x in times]} s."
                     )
                     break
+
+                if candidate == 1:
+                    # If batch 1 reaches this point it failed the preferred
+                    # repeated memory policy. Check whether it still physically
+                    # completes, because no smaller physical batch exists.
+                    physical = probe(
+                        1,
+                        include_augmentation=True,
+                        clear_cache=True,
+                    )
+                    physically_fit = isinstance(physical[2], (int, float))
+                    if physically_fit:
+                        last_good = 1
+                        self.logger.warning(
+                            "Batch size 1 physically completes repeated augmented "
+                            "training but exceeds the preferred VRAM/headroom policy. "
+                            "Using batch 1 because no smaller physical batch exists."
+                        )
+                        break
+
+                    base_model.load_state_dict(initial_state)
+                    del initial_state, probe_opt, sample_image, sample_label
+                    self.model.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    raise RuntimeError(
+                        "Batch size 1 genuinely OOMed during the repeated "
+                        "full-augmentation memory-stability check."
+                    )
+
+                self.logger.warning(
+                    f"Auto batch {candidate} failed the repeated CUDA memory "
+                    "stability check; backing off to a smaller batch."
+                )
                 candidate = max(1, candidate - step)
 
         base_model.load_state_dict(initial_state)
@@ -4104,15 +4827,25 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         with amp_context(self.device, self.cfg["amp"]):
             if is_diffusion_model(self.model):
-                # Diff-UNet diffuses the segmentation itself: feed a one-hot
-                # (B, C, H, W, D) float target derived from the class map.
-                seg = F.one_hot(label.long().squeeze(1),
-                                self.cfg["num_classes"]).permute(0, 4, 1, 2, 3).float()
-                pred_noise, true_noise = self.model(image, seg)
-                loss = F.mse_loss(pred_noise, true_noise)
+                # START_X Diff-UNet: diffuse the one-hot segmentation state
+                # internally, predict clean four-class logits, and optimise
+                # with the same 0.5 Dice + 0.5 categorical CE loss used by
+                # every other architecture in the experiment.
+                pred = self.model(image, label)
+                loss = self.criterion(pred, label)
             else:
                 pred = self.model(image)
-                loss = self.criterion(pred, label)
+                if self.cfg.get("model", "").lower() == "deepensemble":
+                    pred, loss = _deep_supervised_output_and_loss(
+                        pred,
+                        label,
+                        self.criterion,
+                        checkpoint_losses=bool(
+                            self.cfg.get("deepensemble_checkpoint_losses", True)
+                        ),
+                    )
+                else:
+                    loss = self.criterion(pred, label)
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.opt)
         nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -4157,7 +4890,15 @@ class Trainer:
                 label_gpu = label.to(self.device, non_blocking=True)
                 with amp_context(self.device, self.cfg["amp"]):
                     pred = self.model(image)
-                    loss = self.criterion(pred, label_gpu)
+                    if self.cfg.get("model", "").lower() == "deepensemble":
+                        pred, loss = _deep_supervised_output_and_loss(
+                            pred,
+                            label_gpu,
+                            self.criterion,
+                            checkpoint_losses=False,
+                        )
+                    else:
+                        loss = self.criterion(pred, label_gpu)
                 losses.append(loss.item())
 
                 pred_cls = pred.argmax(1).detach().cpu().numpy().astype(np.uint8, copy=False)
@@ -4205,7 +4946,15 @@ class Trainer:
                 label_gpu = label.to(self.device, non_blocking=self.device.type == "cuda")
                 with amp_context(self.device, self.cfg["amp"]):
                     pred = self.model(image)
-                    loss = self.criterion(pred, label_gpu)
+                    if self.cfg.get("model", "").lower() == "deepensemble":
+                        pred, loss = _deep_supervised_output_and_loss(
+                            pred,
+                            label_gpu,
+                            self.criterion,
+                            checkpoint_losses=False,
+                        )
+                    else:
+                        loss = self.criterion(pred, label_gpu)
                 losses.append(loss.item())
 
                 pred_cls = pred.argmax(1).detach().cpu().numpy().astype(np.uint8, copy=False)
@@ -4328,6 +5077,18 @@ class Trainer:
                     cpu_gpu_step_s += time.perf_counter() - step_started
                     epoch_loss_sum += float(loss_tensor.item())
                 epoch_loss_count += 1
+
+                if (
+                    cfg.get("model", "").lower() == "deepensemble"
+                    and self.device.type == "cuda"
+                    and step % max(
+                        1, int(cfg.get("deepensemble_empty_cache_interval", 10))
+                    ) == 0
+                ):
+                    # Release only unused cached blocks. Live model tensors,
+                    # gradients and optimiser state are untouched.
+                    torch.cuda.empty_cache()
+
                 global_step = (epoch - 1) * len(self.train_loader) + step
 
                 # Reading a CUDA scalar with .item() is a synchronisation point.
@@ -4697,12 +5458,20 @@ class Evaluator:
         if not cfg.get("checkpoint"):
             raise ValueError("--checkpoint must be provided for evaluation mode.")
 
-        ckpt = torch.load(cfg["checkpoint"], map_location=self.device)
+        is_deepensemble = cfg.get("model", "").lower() == "deepensemble"
+        ckpt = torch.load(
+            cfg["checkpoint"],
+            map_location="cpu" if is_deepensemble else self.device
+        )
         saved_cfg = ckpt.get("cfg", cfg)
         saved_cfg.update({k: cfg[k] for k in ["data_dir", "val_ratio", "seed", "num_workers"]})
 
-        self.model = build_model(saved_cfg).to(self.device)
-        self.model.load_state_dict(ckpt["state_dict"])
+        self.model = build_model(saved_cfg)
+        if is_deepensemble and "ensemble_member_state_dicts" in ckpt:
+            self.model.load_member_state_dicts(ckpt["ensemble_member_state_dicts"])
+        else:
+            self.model.load_state_dict(ckpt["state_dict"])
+        self.model = self.model.to(self.device)
         self.model.eval()
         logger.info(f"Loaded checkpoint: {cfg['checkpoint']}")
 
@@ -4823,22 +5592,142 @@ class FixedSplitRunner:
             for existing in rows:
                 writer.writerow({k: existing.get(k, "") for k in row})
 
+    def _train_deepensemble_members(self):
+        """Train five paper-based ensemble members sequentially on the fixed split."""
+        cfg = self.cfg
+        logger = self.logger
+        member_count = max(1, int(cfg.get("deepensemble_members", 5)))
+        base_seed = int(cfg.get("seed", 123))
+
+        logger.info(
+            f"DeepEnsemble: training {member_count} independently initialised "
+            "Henry-style members sequentially on the same fixed train/validation split."
+        )
+        logger.info(
+            "Paper-based elements: width 48, GroupNorm, dilated pseudo-fifth stage, "
+            "trilinear decoder, four deep-supervision heads, ensemble probability "
+            "averaging and 16-way TTA. The study's four-class loss/labels and fixed "
+            "80/10/10 split are retained for comparability."
+        )
+
+        member_states = []
+        member_meta = []
+        total_training_s = 0.0
+        peak_vram_gb = 0.0
+        batch_sizes = []
+
+        ensemble_run_dir = (
+            self.save_dir
+            / f"deepensemble_{datetime.now():%Y%m%d_%H%M%S}_fixed_80_10_10_ensemble"
+        )
+        ensemble_run_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx in range(member_count):
+            member_cfg = dict(cfg)
+            member_cfg["_deepensemble_training_member"] = True
+            member_cfg["deepensemble_member_index"] = idx
+            member_cfg["seed"] = base_seed + idx
+            member_cfg["checkpoint"] = None
+
+            logger.info("")
+            logger.info("=" * 72)
+            logger.info(
+                f"DeepEnsemble member {idx + 1}/{member_count}, seed={member_cfg['seed']}"
+            )
+            logger.info("=" * 72)
+
+            trainer = Trainer(
+                member_cfg,
+                logger,
+                train_pts=self.train_patients,
+                val_pts=self.val_patients,
+                run_suffix=f"fixed_80_10_10_member{idx + 1:02d}",
+            )
+            trainer.run()
+
+            best_member = trainer.run_dir / "best.pth"
+            if not best_member.exists():
+                raise RuntimeError(
+                    f"DeepEnsemble member {idx + 1} did not create best.pth"
+                )
+
+            ckpt = torch.load(best_member, map_location="cpu")
+            member_states.append(ckpt["state_dict"])
+            member_meta.append({
+                "member": idx + 1,
+                "seed": member_cfg["seed"],
+                "best_epoch": trainer.best_epoch,
+                "best_validation_dice": trainer.best_dice,
+                "training_time_s": trainer.training_time_s,
+                "peak_vram_gb": trainer.peak_vram_gb,
+                "batch_size": trainer.effective_batch_size,
+                "checkpoint": str(best_member),
+            })
+
+            total_training_s += float(trainer.training_time_s)
+            peak_vram_gb = max(peak_vram_gb, float(trainer.peak_vram_gb))
+            batch_sizes.append(int(trainer.effective_batch_size))
+
+            trainer.release_runtime_resources()
+            del trainer, ckpt
+            gc.collect()
+            _safe_cuda_release()
+
+        ensemble_ckpt = ensemble_run_dir / "best.pth"
+        torch.save({
+            "model": "deepensemble",
+            "cfg": cfg,
+            "ensemble_member_state_dicts": member_states,
+            "ensemble_members": member_count,
+            "member_metadata": member_meta,
+            "paper_reference": "Henry et al., arXiv:2011.01045",
+        }, ensemble_ckpt)
+
+        if len(set(batch_sizes)) > 1:
+            logger.warning(
+                f"DeepEnsemble member batch sizes differed: {batch_sizes}. "
+                "The efficiency table reports the smallest physical member batch."
+            )
+
+        summary = SimpleNamespace(
+            run_dir=ensemble_run_dir,
+            training_time_s=float(total_training_s),
+            peak_vram_gb=float(peak_vram_gb),
+            best_epoch=[m["best_epoch"] for m in member_meta],
+            stop_reason="ensemble_members_completed",
+            best_dice=float(np.mean([m["best_validation_dice"] for m in member_meta])),
+            effective_batch_size=int(min(batch_sizes) if batch_sizes else 1),
+            batch_size=int(min(batch_sizes) if batch_sizes else 1),
+        )
+
+        with open(ensemble_run_dir / "ensemble_members.json", "w", encoding="utf-8") as f:
+            json.dump(member_meta, f, indent=2, default=str)
+
+        logger.info(
+            f"DeepEnsemble members complete: total training={total_training_s:.1f}s | "
+            f"peak member VRAM={peak_vram_gb:.2f}GB | checkpoint={ensemble_ckpt}"
+        )
+        return summary, ensemble_ckpt
+
     def run(self):
         cfg = self.cfg
         logger = self.logger
 
-        trainer = Trainer(
-            cfg,
-            logger,
-            train_pts=self.train_patients,
-            val_pts=self.val_patients,
-            run_suffix="fixed_80_10_10",
-        )
-        trainer.run()
+        if cfg.get("model", "").lower() == "deepensemble":
+            trainer, best_ckpt = self._train_deepensemble_members()
+        else:
+            trainer = Trainer(
+                cfg,
+                logger,
+                train_pts=self.train_patients,
+                val_pts=self.val_patients,
+                run_suffix="fixed_80_10_10",
+            )
+            trainer.run()
 
-        best_ckpt = trainer.run_dir / "best.pth"
-        if not best_ckpt.exists():
-            raise RuntimeError(f"Best checkpoint was not created: {best_ckpt}")
+            best_ckpt = trainer.run_dir / "best.pth"
+            if not best_ckpt.exists():
+                raise RuntimeError(f"Best checkpoint was not created: {best_ckpt}")
 
         logger.info("Training/selection complete. Beginning one-time evaluation on the fixed 10% final test split.")
 
@@ -4953,6 +5842,14 @@ class FixedSplitRunner:
             "best_epoch": trainer.best_epoch,
             "stop_reason": trainer.stop_reason,
             "best_validation_dice": trainer.best_dice,
+            "deepensemble_members": (
+                int(cfg.get("deepensemble_members", 5))
+                if cfg.get("model", "").lower() == "deepensemble" else 1
+            ),
+            "deepensemble_tta": (
+                bool(cfg.get("deepensemble_tta", True))
+                if cfg.get("model", "").lower() == "deepensemble" else False
+            ),
             "final_test_dice": dice_mean,
             "final_test_hd95": hd95_mean,
             "gflops_definition": "forward inference GFLOPs per complete patient (multiply-add = 2 FLOPs)",
@@ -5045,9 +5942,17 @@ class CrossValidationRunner:
         loading, Dice/HD95 calculation and CSV writing.
         """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ckpt = torch.load(str(ckpt_path), map_location=device)
-        model = build_model(self.cfg).to(device)
-        model.load_state_dict(ckpt["state_dict"])
+        is_deepensemble = self.cfg.get("model", "").lower() == "deepensemble"
+        ckpt = torch.load(
+            str(ckpt_path),
+            map_location="cpu" if is_deepensemble else device
+        )
+        model = build_model(self.cfg)
+        if is_deepensemble and "ensemble_member_state_dicts" in ckpt:
+            model.load_member_state_dicts(ckpt["ensemble_member_state_dicts"])
+        else:
+            model.load_state_dict(ckpt["state_dict"])
+        model = model.to(device)
         if (
             device.type == "cuda"
             and self.cfg.get("channels_last_3d", True)
@@ -5090,12 +5995,38 @@ class CrossValidationRunner:
         # in a complete patient volume so architectures remain comparable.
         first_image_for_profile = move_image_to_device(first_batch[0][:1], device, self.cfg)
         if self.static_gflops_per_case is None:
-            gflops_per_input = estimate_gflops(model, first_image_for_profile, self.cfg)
-            if is_2d_model(self.cfg):
-                avg_slices_per_case = len(ds) / max(1, len(self.test_patients))
-                self.static_gflops_per_case = gflops_per_input * avg_slices_per_case
+            if is_deepensemble:
+                # Count one Henry member once, then scale by the number of
+                # independently trained members and TTA predictions. This is
+                # mathematically equivalent to profiling the complete wrapper
+                # but avoids running 80 full-volume forwards just for FLOP hooks.
+                profile_member = HenryEquiUNet3D(
+                    in_channels=self.cfg["in_channels"],
+                    out_channels=self.cfg["num_classes"],
+                    width=int(self.cfg.get("deepensemble_width", 48)),
+                    norm_groups=int(self.cfg.get("deepensemble_norm_groups", 16)),
+                    deep_supervision=False,
+                    activation_checkpointing=False,
+                ).to(device)
+                profile_member.eval()
+                gflops_one = estimate_gflops(
+                    profile_member, first_image_for_profile, self.cfg
+                )
+                member_count = int(self.cfg.get("deepensemble_members", 5))
+                tta_count = 16 if bool(self.cfg.get("deepensemble_tta", True)) else 1
+                self.static_gflops_per_case = (
+                    gflops_one * member_count * tta_count
+                )
+                del profile_member
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             else:
-                self.static_gflops_per_case = gflops_per_input
+                gflops_per_input = estimate_gflops(model, first_image_for_profile, self.cfg)
+                if is_2d_model(self.cfg):
+                    avg_slices_per_case = len(ds) / max(1, len(self.test_patients))
+                    self.static_gflops_per_case = gflops_per_input * avg_slices_per_case
+                else:
+                    self.static_gflops_per_case = gflops_per_input
             self.logger.info(
                 f"Model complexity: {self.static_gflops_per_case:.3f} GFLOPs per patient inference"
             )
@@ -5104,6 +6035,8 @@ class CrossValidationRunner:
         # the inference-time measurement.
         warmup_image = move_image_to_device(first_batch[0], device, self.cfg)
         warmup_steps = max(0, int(self.cfg.get("inference_warmup", 3)))
+        if is_deepensemble:
+            warmup_steps = min(warmup_steps, 1)
         with torch.inference_mode():
             for _ in range(warmup_steps):
                 with amp_context(device, self.cfg.get("amp", True)):
@@ -5503,15 +6436,15 @@ class CrossValidationRunner:
 
 MODEL_MENU = [
     # 2-D models, ranked by trainable parameter count
-    ("unet2d",          "UNet 2D (~7.85M params)"),
+    ("unet2d",          "UNet 2D (~7.76M params, corrected)"),
     ("hvu",             "HVU 2D DenseVU-ED (~36.51M params)"),
     ("deeplabv3plus2d", "DeepLabV3+ 2D (~40.35M params)"),
 
     # 3-D models, ranked by trainable parameter count
-    ("diff_unet",       "Diff-UNet 3D (~10.99M params)"),
+    ("diff_unet",       "Diff-UNet 3D (~10.05M params)"),
     ("hybridattunet",        "HybridAttUnet 3D (~14.10M params)"),
     ("unet3d",          "UNet 3D (~22.58M params)"),
-    ("deepensemble",        "DeepEnsemble 3D (~34.71M params)"),
+    ("deepensemble",        "DeepEnsemble 3D (5 x ~23.16M = ~115.78M params)"),
 ]
 
 
@@ -5606,6 +6539,29 @@ def parse_args():
 
     # Model
     p.add_argument("--base_filters", type=int, default=None)
+    p.add_argument("--unet2d_max_batch_size", type=int, default=None,
+                   help="Hard physical batch-size ceiling for UNet2D (default 64)")
+    p.add_argument("--unet2d_norm_groups", type=int, default=None,
+                   help="Number of GroupNorm groups used by UNet2D (default 8)")
+    p.add_argument(
+        "--unet2d_skip_empty_ratio",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of tumour-free axial training slices discarded by UNet2D. "
+            "Corrected default is 0.0, meaning all native slices are retained."
+        ),
+    )
+    p.add_argument("--deepensemble_members", type=int, default=None,
+                   help="Number of independently trained DeepEnsemble members (default 5)")
+    p.add_argument("--deepensemble_width", type=int, default=None,
+                   help="Henry-style base feature width (paper default 48)")
+    p.add_argument("--deepensemble_max_batch_size", type=int, default=None,
+                   help="Hard physical batch-size ceiling per DeepEnsemble member (default 1)")
+    p.add_argument("--deepensemble_empty_cache_interval", type=int, default=None,
+                   help="Release unused CUDA cache every N DeepEnsemble training batches (default 10)")
+    p.add_argument("--no_deepensemble_tta", action="store_true",
+                   help="Disable paper-style 16-way DeepEnsemble test-time augmentation")
 
     # Training
     p.add_argument("--epochs",     type=int,   default=None)
@@ -5622,7 +6578,9 @@ def parse_args():
     p.add_argument("--max_batch_size_2d", type=int, default=None,
                    help="Maximum 2-D batch size considered by the auto tuner (default 1048)")
     p.add_argument("--max_batch_size_3d", type=int, default=None,
-                   help="Maximum 3-D batch size considered by the auto tuner (default 8)")
+                   help="Maximum 3-D batch size considered by the auto tuner")
+    p.add_argument("--diff_unet_max_batch_size", type=int, default=None,
+                   help="Hard physical batch-size ceiling for Diff-UNet (default 1; prevents unsafe batch-2 probes)")
     p.add_argument("--batch_size_step", type=int, default=None,
                    help="2-D batch-size refinement step (default 16)")
     p.add_argument("--lr",         type=float, default=None)
@@ -5686,14 +6644,14 @@ def main():
         print("\nAvailable models:")
         descriptions = {
             # 2-D models, ordered by trainable parameter count
-            "unet2d":          "UNet 2D (~7.85M params) - classical 2-D U-Net on axial slices",
+            "unet2d":          "UNet 2D (~7.76M params) - corrected padded 2-D U-Net on axial slices",
             "hvu":             "HVU 2D DenseVU-ED (~36.51M params) - DenseNet121 + ViT + U-Net",
             "deeplabv3plus2d": "DeepLabV3+ 2D (~40.35M params) - ResNet-50 style encoder + ASPP",
             # 3-D models, ordered by trainable parameter count
-            "diff_unet":       "Diff-UNet 3D (~10.99M params) - diffusion-embedded U-Net",
+            "diff_unet":       "Diff-UNet 3D (~10.05M params) - diffusion-embedded U-Net",
             "hybridattunet":        "HybridAttUnet 3D (~14.10M params) - residual attention + squeeze-excitation",
             "unet3d":          "UNet 3D (~22.58M params) - vanilla volumetric U-Net",
-            "deepensemble":        "DeepEnsemble 3D (~34.71M params) - residual/equivariant BraTS architecture",
+            "deepensemble":        "DeepEnsemble 3D - 5-member Henry-style deep-supervised ensemble with TTA",
         }
         for k, v in descriptions.items():
             print(f"  {k:<18}  {v}")
@@ -5755,6 +6713,11 @@ def main():
         cfg["cuda_prefetch"] = False
     if isinstance(cfg["patch_size"], list):
         cfg["patch_size"] = tuple(cfg["patch_size"])
+
+    if not 0.0 <= float(cfg.get("unet2d_skip_empty_ratio", 0.0)) <= 1.0:
+        raise ValueError(
+            "unet2d_skip_empty_ratio must be between 0.0 and 1.0."
+        )
 
     run_dir = Path(cfg["save_dir"])
     run_dir.mkdir(parents=True, exist_ok=True)
