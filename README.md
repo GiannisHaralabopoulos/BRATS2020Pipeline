@@ -4,8 +4,6 @@ A unified PyTorch pipeline for training, validating, testing, and benchmarking s
 
 The pipeline was designed for controlled architecture comparison. It uses a fixed patient-level split, a common multi-class loss, shared GPU augmentation, consistent early stopping, and the same final evaluation procedure across models, while retaining architecture-specific requirements such as 2D versus 3D inputs, internal resizing, iterative diffusion inference, and ensemble test-time augmentation.
 
-> The uploaded source file is named `brats_pipeline(3).py`. The examples below use the cleaner repository name `brats_pipeline.py`. Rename the file or substitute the uploaded filename in the commands.
-
 ## Main features
 
 - Seven 2D and 3D segmentation architectures in one training pipeline
