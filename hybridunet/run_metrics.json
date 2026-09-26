@@ -1,0 +1,22 @@
+{
+  "model": "hvu",
+  "training_time_s": 15097.8966646,
+  "trainable_params": 36514564,
+  "trainable_params_m": 36.514564,
+  "peak_vram_gb": 20.343297958374023,
+  "best_epoch": 127,
+  "best_dice": 0.8439495479456376,
+  "best_val_metrics": {
+    "loss": 0.0660301868985597,
+    "dice_WT": 0.9092133464039983,
+    "hd95_WT": 6.550838079822491,
+    "dice_TC": 0.8509007595680855,
+    "hd95_TC": 6.73373444827393,
+    "dice_ET": 0.7717345378648288,
+    "hd95_ET": 3.2261558443702483,
+    "dice_mean": 0.8439495479456376,
+    "hd95_mean": 5.503576124155557
+  },
+  "epochs_completed": 157,
+  "stop_reason": "early_stopping"
+}
