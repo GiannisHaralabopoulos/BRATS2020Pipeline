@@ -108,7 +108,7 @@ The default training workflow uses one deterministic patient-level split:
 10% final held-out test
 ```
 
-With the 369 labelled BraTS2020 cases, this gives approximately:
+With the 369 labelled BraTS2020 cases, this gives:
 
 ```text
 295 training patients
@@ -122,7 +122,7 @@ The split is generated using seed `123` and saved to:
 runs/fixed_split.json
 ```
 
-The same split file is reused across architectures when the metadata match.
+The same split file is reused across architectures when the metadata match. For the experiments reported in the manuscript, the exact fixed split has additionally been archived at the repository root as `fixed_split.json`.
 
 The validation subset is used for:
 
@@ -487,6 +487,70 @@ python brats_pipeline.py --data_dir /path/to/BraTS2020
 
 Even if `--model` is supplied, the interactive menu remains the default unless `--no_model_prompt` is also used.
 
+### Reproducing the reported experiments
+
+The experiments reported in the associated manuscript were re-executed using the fixed 80% training, 10% validation, and 10% final test protocol implemented in this repository.
+
+The reported reruns used the interactive training workflow. No architecture-specific command-line configuration was used for the manuscript reruns. After starting the pipeline, the required architecture was selected from the numbered model menu:
+
+```text
+1. UNet 2D
+2. HVU 2D / DenseVU-ED
+3. DeepLabV3+ 2D
+4. Diff-UNet 3D
+5. HybridAttUNet 3D
+6. UNet 3D
+7. DeepEnsembled U-Net 3D
+```
+
+The exact settings resolved for each run are preserved in the archived `config.json` files where available. These files provide the authoritative record of the settings used for those archived runs.
+
+The exact patient partition used across the experiments is archived at the repository root as:
+
+```text
+fixed_split.json
+```
+
+It contains the 295 training patients, 37 validation patients, and 37 final held-out test patients used in the reported analyses.
+
+The final patient-level and aggregate test results are archived in:
+
+```text
+results/
+```
+
+This directory contains `final_test_per_patient_<model>.csv` and `final_test_summary_<model>.csv` files for all seven architectures. The patient-level files contain the Dice and HD95 values used for the reported descriptive statistics and paired statistical comparisons.
+
+At repository commit `2bd62f6f66aa4e1a34c97eaf671b66ac53fe05e9`, run-specific artefacts are archived in the following architecture directories:
+
+```text
+unet/              -> UNet 2D
+deeplabsv3/        -> DeepLabV3+ 2D
+diff_unet/         -> Diff-UNet 3D
+hybridattunet/     -> HybridAttUNet 3D
+unet3D/            -> UNet 3D
+deepensemble/      -> DeepEnsembled U-Net 3D
+```
+
+For the single-model architecture directories, the archived material includes:
+
+```text
+config.json
+training_history.csv
+run_metrics.json
+fixed_split_experiment_summary.json
+```
+
+`config.json` records the complete resolved configuration used for the archived run. `training_history.csv` provides the structured epoch-level training log, including training and validation losses, Dice and HD95 values, learning rate, timing measurements, memory measurements, and GPU telemetry where enabled. `run_metrics.json` records run-level information such as training duration, peak allocated VRAM, best epoch, validation performance, completed epochs, and stopping reason. `fixed_split_experiment_summary.json` records the patient counts, selected checkpoint, validation performance, and final held-out test performance.
+
+For the DeepEnsembled U-Net, equivalent artefacts are provided separately for each of the five independently trained ensemble members in `Ensemble1` to `Ensemble5`, together with `ensemble_members.json` and the final fixed-split experiment summary.
+
+The `hybridattunet/` directory additionally contains the ablation and sensitivity experiment outputs reported in the manuscript.
+
+At this specific commit, final HVU patient-level and summary results are present in `results/`, but the corresponding run-specific HVU configuration and training-history directory is not included in the snapshot.
+
+At the repository root, `model_metrics.csv` and `efficiency_metrics.csv` provide the aggregate predictive and computational measurements archived with the reported experiments.
+
 ### Non-interactive training
 
 For scripted runs, supply both `--model` and `--no_model_prompt`:
@@ -580,7 +644,7 @@ python brats_pipeline.py \
   --test_ratio 0.10
 ```
 
-This is separate from the default fixed 80/10/10 experiment and is not required for the main workflow.
+This is separate from the default fixed 80/10/10 experiment and was not used to obtain the results reported in the manuscript.
 
 ## Output files
 
@@ -592,7 +656,7 @@ The default `save_dir` is:
 
 ### Shared experiment outputs
 
-Across model runs, the pipeline maintains:
+During execution, the pipeline can maintain:
 
 ```text
 runs/
@@ -661,18 +725,26 @@ best.pth
 ensemble_members.json
 ```
 
+The repository snapshot does not archive every raw runtime file produced locally. In particular, the root `run.log`, model checkpoints, and TensorBoard event files are not included in commit `2bd62f6f66aa4e1a34c97eaf671b66ac53fe05e9`. The archived `training_history.csv`, `run_metrics.json`, fixed-split summaries, patient-level result files, and aggregate metric files provide the structured records retained for the reported reruns.
+
 ## Reproducibility notes
 
-- Default random seed is `123`.
-- The fixed patient split is persisted and reused across models.
-- The official unlabelled BraTS2020 validation cohort is excluded from the main experiment.
-- Validation is performed every epoch by default.
-- Early stopping is based on validation mean Dice.
-- Final test evaluation occurs only after model selection.
-- All models use the same four-class formulation and common combined loss.
-- Data augmentation is disabled during validation and testing.
-- DeepEnsemble members use consecutive seeds starting from the configured base seed.
-- `torch.compile` is disabled by default because repeated compilation and autotuning can consume substantial host memory on Windows.
+- The reported experiments used a single fixed 80/10/10 patient-level split rather than cross-validation.
+- The exact split used for the reported reruns is archived as `fixed_split.json`.
+- The default random seed was `123`, with consecutive seeds used for the five DeepEnsemble members.
+- The reported reruns were initiated through the interactive numbered model-selection menu.
+- No architecture-specific command-line settings were used for the reported reruns.
+- Run-specific resolved settings are preserved in the archived `config.json` files where present.
+- Structured epoch-level training logs are preserved in the corresponding `training_history.csv` files.
+- Run-level measurements are preserved in `run_metrics.json` where present.
+- Final patient-level Dice and HD95 measurements for all seven architectures are provided in `results/`.
+- Validation was performed every epoch and was used for checkpoint selection and early stopping.
+- The final 10% test subset was evaluated only after model selection.
+- The official unlabelled BraTS2020 validation cohort was not used.
+- All architectures used the same four-class formulation and common combined loss.
+- Data augmentation was applied only during training.
+- Cross-validation functionality remains available in the source code as an optional legacy mode, but it was not used to obtain the results reported in the manuscript.
+- `torch.compile` was disabled by default.
 
 ## Hardware and performance notes
 
