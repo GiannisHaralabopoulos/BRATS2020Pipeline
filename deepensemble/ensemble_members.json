@@ -1,0 +1,52 @@
+[
+  {
+    "member": 1,
+    "seed": 123,
+    "best_epoch": 49,
+    "best_validation_dice": 0.8496325549932698,
+    "training_time_s": 23447.1395007,
+    "peak_vram_gb": 21.474231719970703,
+    "batch_size": 1,
+    "checkpoint": "runs\\deepensemble_20260907_092434_fixed_80_10_10_member01\\best.pth"
+  },
+  {
+    "member": 2,
+    "seed": 124,
+    "best_epoch": 29,
+    "best_validation_dice": 0.8392150587290725,
+    "training_time_s": 17602.9313604,
+    "peak_vram_gb": 21.37141180038452,
+    "batch_size": 1,
+    "checkpoint": "runs\\deepensemble_20260907_155524_fixed_80_10_10_member02\\best.pth"
+  },
+  {
+    "member": 3,
+    "seed": 125,
+    "best_epoch": 65,
+    "best_validation_dice": 0.8508123380109271,
+    "training_time_s": 27928.339122899997,
+    "peak_vram_gb": 21.37141180038452,
+    "batch_size": 1,
+    "checkpoint": "runs\\deepensemble_20260907_204853_fixed_80_10_10_member03\\best.pth"
+  },
+  {
+    "member": 4,
+    "seed": 126,
+    "best_epoch": 68,
+    "best_validation_dice": 0.8481614964895196,
+    "training_time_s": 28698.922003700005,
+    "peak_vram_gb": 21.37141180038452,
+    "batch_size": 1,
+    "checkpoint": "runs\\deepensemble_20260908_043424_fixed_80_10_10_member04\\best.pth"
+  },
+  {
+    "member": 5,
+    "seed": 127,
+    "best_epoch": 102,
+    "best_validation_dice": 0.8510808699345608,
+    "training_time_s": 39034.10666979999,
+    "peak_vram_gb": 21.37141180038452,
+    "batch_size": 1,
+    "checkpoint": "runs\\deepensemble_20260908_123246_fixed_80_10_10_member05\\best.pth"
+  }
+]

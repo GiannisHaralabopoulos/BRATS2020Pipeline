@@ -1,0 +1,23 @@
+{
+  "model": "deepensemble",
+  "design": "80% train / 10% validation / 10% final test from labelled BraTS cohort",
+  "train_n": 295,
+  "validation_n": 37,
+  "final_test_n": 37,
+  "best_epoch": [
+    49,
+    29,
+    65,
+    68,
+    102
+  ],
+  "stop_reason": "ensemble_members_completed",
+  "best_validation_dice": 0.84778046363147,
+  "deepensemble_members": 5,
+  "deepensemble_tta": true,
+  "final_test_dice": 0.8671459459459459,
+  "final_test_hd95": 4.4044405405405405,
+  "gflops_definition": "forward inference GFLOPs per complete patient (multiply-add = 2 FLOPs)",
+  "split_file": "runs\\fixed_split.json",
+  "best_checkpoint": "runs\\deepensemble_20260907_092433_fixed_80_10_10_ensemble\\best.pth"
+}
