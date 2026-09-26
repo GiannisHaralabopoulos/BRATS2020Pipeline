@@ -1,12 +1,6 @@
 # Unified BraTS2020 Brain Tumour Segmentation Pipeline
 
-This repository contains the code and archived outputs used for a controlled comparison of seven brain tumour segmentation architectures on the labelled BraTS2020 cohort, together with dedicated HybridAttUNet ablation and pipeline-sensitivity analyses.
-
-This README describes repository commit:
-
-```text
-0bced1abbbc92b663092e3d2fbd23d1a4a6b8dac
-```
+This repository includes the primary benchmark pipeline, dedicated HybridAttUNet ablation and sensitivity scripts, the fixed patient-level split, archived patient-level results, run summaries, training histories, and locked Python requirements used for the reported experiments.
 
 The commit adds the standalone `Ablation.py` and `Sensitivity.py` experiment scripts to the main benchmark pipeline and retains the archived patient-level results, fixed patient split, run summaries, training histories, and locked Python requirements.
 
