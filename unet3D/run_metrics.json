@@ -1,0 +1,22 @@
+{
+  "model": "unet3d",
+  "training_time_s": 25849.4863284,
+  "trainable_params": 22580964,
+  "trainable_params_m": 22.580964,
+  "peak_vram_gb": 14.50999402999878,
+  "best_epoch": 53,
+  "best_dice": 0.8190168015666036,
+  "best_val_metrics": {
+    "loss": 0.15733224027664275,
+    "dice_WT": 0.8901821842222949,
+    "hd95_WT": 4.991439453054102,
+    "dice_TC": 0.7732019633646414,
+    "hd95_TC": 5.68987556937297,
+    "dice_ET": 0.7936662571128746,
+    "hd95_ET": 3.175334698417735,
+    "dice_mean": 0.8190168015666036,
+    "hd95_mean": 4.618883240281602
+  },
+  "epochs_completed": 83,
+  "stop_reason": "early_stopping"
+}

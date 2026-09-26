@@ -1,0 +1,22 @@
+{
+  "model": "unet2d",
+  "training_time_s": 11750.9883857,
+  "trainable_params": 7763428,
+  "trainable_params_m": 7.763428,
+  "peak_vram_gb": 10.886442184448242,
+  "best_epoch": 109,
+  "best_dice": 0.8496074427160033,
+  "best_val_metrics": {
+    "loss": 0.06185696050711158,
+    "dice_WT": 0.9064021891838795,
+    "hd95_WT": 4.667635967197784,
+    "dice_TC": 0.8392595648765564,
+    "hd95_TC": 5.93761171717427,
+    "dice_ET": 0.8031605740875739,
+    "hd95_ET": 2.9517313581438063,
+    "dice_mean": 0.8496074427160033,
+    "hd95_mean": 4.518993014171953
+  },
+  "epochs_completed": 139,
+  "stop_reason": "early_stopping"
+}

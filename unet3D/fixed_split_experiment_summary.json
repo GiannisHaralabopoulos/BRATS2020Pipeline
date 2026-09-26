@@ -1,0 +1,15 @@
+{
+  "model": "unet3d",
+  "design": "80% train / 10% validation / 10% final test from labelled BraTS cohort",
+  "train_n": 295,
+  "validation_n": 37,
+  "final_test_n": 37,
+  "best_epoch": 53,
+  "stop_reason": "early_stopping",
+  "best_validation_dice": 0.8190168015666036,
+  "final_test_dice": 0.8079999999999999,
+  "final_test_hd95": 5.736240540540541,
+  "gflops_definition": "forward inference GFLOPs per complete patient (multiply-add = 2 FLOPs)",
+  "split_file": "runs\\fixed_split.json",
+  "best_checkpoint": "runs\\unet3d_20260829_024552_fixed_80_10_10\\best.pth"
+}

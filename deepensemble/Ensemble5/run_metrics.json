@@ -1,0 +1,22 @@
+{
+  "model": "deepensemble",
+  "training_time_s": 39034.10666979999,
+  "trainable_params": 23155508,
+  "trainable_params_m": 23.155508,
+  "peak_vram_gb": 21.37141180038452,
+  "best_epoch": 102,
+  "best_dice": 0.8510808699345608,
+  "best_val_metrics": {
+    "loss": 0.1347621625692055,
+    "dice_WT": 0.9029725612979015,
+    "hd95_WT": 4.929210156088039,
+    "dice_TC": 0.8538662267974768,
+    "hd95_TC": 3.9258312444328474,
+    "dice_ET": 0.7964038217083037,
+    "hd95_ET": 3.702672399668175,
+    "dice_mean": 0.8510808699345608,
+    "hd95_mean": 4.1859046000630205
+  },
+  "epochs_completed": 132,
+  "stop_reason": "early_stopping"
+}

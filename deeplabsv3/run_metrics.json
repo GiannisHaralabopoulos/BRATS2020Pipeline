@@ -1,0 +1,22 @@
+{
+  "model": "deeplabv3plus2d",
+  "training_time_s": 4057.4717264999963,
+  "trainable_params": 40350436,
+  "trainable_params_m": 40.350436,
+  "peak_vram_gb": 21.303314685821533,
+  "best_epoch": 76,
+  "best_dice": 0.8224017310995343,
+  "best_val_metrics": {
+    "loss": 0.07945705289867791,
+    "dice_WT": 0.8896048487843694,
+    "hd95_WT": 10.42812306396512,
+    "dice_TC": 0.8178411025453258,
+    "hd95_TC": 8.573287510450344,
+    "dice_ET": 0.7597592419689075,
+    "hd95_ET": 4.153804553505451,
+    "dice_mean": 0.8224017310995343,
+    "hd95_mean": 7.718405042640306
+  },
+  "epochs_completed": 106,
+  "stop_reason": "early_stopping"
+}
