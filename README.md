@@ -1,46 +1,72 @@
 # Unified BraTS2020 Brain Tumour Segmentation Pipeline
 
-A unified PyTorch pipeline for training, validating, testing, and benchmarking seven brain tumour segmentation architectures on the labelled BraTS2020 cohort.
+This repository contains the code and archived outputs used for a controlled comparison of seven brain tumour segmentation architectures on the labelled BraTS2020 cohort, together with dedicated HybridAttUNet ablation and pipeline-sensitivity analyses.
 
-The pipeline was designed for controlled architecture comparison. It uses a fixed patient-level split, a common multi-class loss, shared GPU augmentation, consistent early stopping, and the same final evaluation procedure across models, while retaining architecture-specific requirements such as 2D versus 3D inputs, internal resizing, iterative diffusion inference, and ensemble test-time augmentation.
+This README describes repository commit:
 
-## Main features
+```text
+0bced1abbbc92b663092e3d2fbd23d1a4a6b8dac
+```
 
-- Seven 2D and 3D segmentation architectures in one training pipeline
-- Fixed patient-level 80% training, 10% validation, and 10% final test split
-- Reuses the same saved split across architectures
-- Four-class softmax segmentation with background, NCR/NET, oedema, and enhancing tumour
-- Combined loss with 0.5 foreground Dice loss and 0.5 categorical cross-entropy
-- Patient-level Dice and HD95 for whole tumour, tumour core, and enhancing tumour
-- Native PyTorch GPU augmentation
-- Automatic VRAM-aware batch-size tuning
-- Mixed-precision training
-- Memory-mapped preprocessing cache
-- Full patient-level computational benchmarking
-- Early stopping and best-checkpoint selection
-- Patient-level CSV outputs suitable for paired statistical comparisons
-- Optional legacy k-fold cross-validation mode
-- Windows and RTX 5090-oriented memory and worker safeguards
+The commit adds the standalone `Ablation.py` and `Sensitivity.py` experiment scripts to the main benchmark pipeline and retains the archived patient-level results, fixed patient split, run summaries, training histories, and locked Python requirements.
 
-## Models
+## Repository overview
+
+The repository contains three executable experiment scripts:
+
+| File | Purpose |
+| --- | --- |
+| `brats_pipeline.py` | Main seven-architecture benchmark |
+| `Ablation.py` | Controlled HybridAttUNet factorial ablation |
+| `Sensitivity.py` | HybridAttUNet pipeline-sensitivity experiments |
+
+The main benchmark compares:
 
 | CLI name | Architecture | Dimensionality | Approx. trainable parameters | Key implementation details |
 | --- | --- | ---: | ---: | --- |
-| `unet2d` | U-Net 2D | 2D | 7.76 M | Four pooling stages, GroupNorm, transposed-convolution decoder |
-| `hvu` | HVU / DenseVU-ED | 2D | 36.51 M | U-Net + DenseNet121 feature branch + Vision Transformer branch |
+| `unet2d` | UNet | 2D | 7.76 M | Conventional four-level U-Net |
+| `hvu` | Hybrid UNet / DenseVU-ED | 2D | 36.51 M | U-Net branch with DenseNet121 and Vision Transformer features |
 | `deeplabv3plus2d` | DeepLabV3+ | 2D | 40.35 M | ResNet-50 style encoder, ASPP, output stride 16 |
-| `diff_unet` | Diff-UNet | 3D | 10.05 M | Separate MRI encoder, START_X diffusion training, 50-step DDIM-style inference |
+| `diff_unet` | DiffUNet | 3D | 10.05 M | Separate MRI encoder, START_X diffusion training, 50-step DDIM-style inference |
 | `hybridattunet` | HybridAttUNet | 3D | 14.10 M | Residual attention modules and squeeze-excitation decoder |
-| `unet3d` | U-Net 3D | 3D | 22.58 M | Conventional volumetric U-Net |
-| `deepensemble` | DeepEnsembled U-Net | 3D | 115.78 M total | Five independently trained Henry-style members, deep supervision, 16-way TTA |
+| `unet3d` | 3DUNet | 3D | 22.58 M | Conventional volumetric U-Net |
+| `deepensemble` | DeepEnsembled UNet | 3D | 115.78 M total | Five independently trained 3D members with deep supervision and 16-way TTA |
 
-The DeepEnsembled U-Net trains its five members sequentially. Peak training VRAM therefore reflects the largest individual member rather than all five models resident simultaneously.
+The DeepEnsembled UNet trains its five members sequentially. Peak training VRAM therefore reflects the largest individual member rather than all five models being resident simultaneously.
 
-## Dataset
+## Main experimental design
 
-The default experiment uses only the labelled BraTS2020 training cohort. The official BraTS2020 validation cohort is not used because it does not contain ground-truth segmentation masks.
+The reported benchmark uses only the labelled BraTS2020 training cohort.
 
-Each patient directory must contain the four MRI modalities and a segmentation mask:
+The 369 labelled cases are divided once at patient level into:
+
+```text
+295 training patients
+37 validation patients
+37 final held-out test patients
+```
+
+This corresponds to a fixed:
+
+```text
+80% training
+10% validation
+10% final test
+```
+
+The identical split is used across all main architectures and secondary experiments. The exact patient allocation is archived at the repository root as:
+
+```text
+fixed_split.json
+```
+
+The validation subset is used for model selection, early stopping, and best-checkpoint selection. The held-out test subset is evaluated only after model selection.
+
+The official BraTS2020 validation cohort is not used because it does not contain ground-truth segmentation masks.
+
+## Dataset structure
+
+Each labelled patient directory must contain the four MRI modalities and a segmentation mask:
 
 ```text
 BraTS2020/
@@ -52,36 +78,33 @@ BraTS2020/
     └── BraTS20_Training_001_seg.nii.gz
 ```
 
-The pipeline searches recursively for patient folders containing `*_flair.nii*`. If `--data_dir` points to a parent directory containing both training and validation data, the labelled training cohort is auto-detected where possible. You can avoid ambiguity by supplying `--train_data_dir` explicitly.
+The pipeline searches recursively for patient folders containing `*_flair.nii*`.
 
-### MRI preprocessing
+If `--data_dir` points to a parent directory containing several BraTS folders, the labelled training cohort is auto-detected where possible. To remove ambiguity, use `--train_data_dir` explicitly.
 
-The four input modalities are:
+## MRI preprocessing
 
-1. FLAIR
-2. T1
-3. T1ce
-4. T2
+The four input modalities are FLAIR, T1, T1ce, and T2.
 
 Each modality is independently z-score normalised over non-zero voxels. Background voxels remain zero.
 
-Native BraTS2020 spatial geometry is:
+Native BraTS2020 geometry is:
 
 ```text
 240 x 240 x 155
 ```
 
-For 3D models, the depth is padded to 160 so that all spatial dimensions are compatible with four downsampling stages:
+For the 3D models, depth is padded to 160 to remain compatible with repeated downsampling:
 
 ```text
 4 x 240 x 240 x 160
 ```
 
-The default experiment uses the full native field of view rather than spatial cropping.
+No spatial cropping is applied to the common full-volume input.
 
 ### Label mapping
 
-BraTS labels are remapped into four mutually exclusive softmax classes:
+BraTS labels are converted into four mutually exclusive softmax classes:
 
 | Pipeline class | Meaning | Original BraTS label |
 | ---: | --- | ---: |
@@ -90,7 +113,7 @@ BraTS labels are remapped into four mutually exclusive softmax classes:
 | 2 | Oedema | 2 |
 | 3 | Enhancing tumour | 4 |
 
-The standard overlapping BraTS regions are reconstructed for evaluation:
+The standard overlapping BraTS evaluation regions are reconstructed as:
 
 ```text
 WT = classes 1 + 2 + 3
@@ -98,84 +121,37 @@ TC = classes 1 + 3
 ET = class 3
 ```
 
-## Experimental design
+## Common loss
 
-The default training workflow uses one deterministic patient-level split:
-
-```text
-80% training
-10% validation
-10% final held-out test
-```
-
-With the 369 labelled BraTS2020 cases, this gives:
-
-```text
-295 training patients
-37 validation patients
-37 final test patients
-```
-
-The split is generated using seed `123` and saved to:
-
-```text
-runs/fixed_split.json
-```
-
-The same split file is reused across architectures when the metadata match. For the experiments reported in the manuscript, the exact fixed split has additionally been archived at the repository root as `fixed_split.json`.
-
-The validation subset is used for:
-
-- model selection
-- early stopping
-- best-checkpoint selection
-
-The final test subset is evaluated only after training and model selection are complete.
-
-## Loss function
-
-All architectures use the same multi-class objective:
+All main architectures use:
 
 ```text
 Loss = 0.5 x DiceLoss + 0.5 x CrossEntropyLoss
 ```
 
-The Dice component:
+The Dice component operates on softmax probabilities, excludes background, averages over the three foreground classes, and uses smoothing of `1e-5`.
 
-- operates on softmax probabilities
-- excludes background
-- averages over the three foreground classes
-- uses smoothing of `1e-5`
+Categorical cross-entropy is computed from the four-class logits and integer class labels.
 
-Cross-entropy is standard categorical cross-entropy over all four mutually exclusive classes.
-
-For the DeepEnsembled U-Net, the same combined loss is applied to the main prediction and each of the four deep-supervision outputs.
+For the DeepEnsembled UNet, the same combined loss is applied to the main prediction and each of the four auxiliary deep-supervision outputs.
 
 ## Data augmentation
 
-Training augmentation is implemented directly in PyTorch and applied on the GPU after batch transfer.
-
-Default augmentation probabilities are:
+Training augmentation is implemented using native PyTorch operations and applied on the GPU after batch transfer.
 
 | Augmentation | Probability | Configuration |
 | --- | ---: | --- |
-| Random flips | 0.5 per spatial axis | 2D or 3D axis matched |
-| Affine transformation | 0.3 | Rotation up to ±10 degrees, scale 0.9 to 1.1 |
+| Random flips | 0.5 per available spatial axis | 2D or 3D matched |
+| Affine transformation | 0.3 | Rotation up to +/-10 degrees, scale 0.9 to 1.1 |
 | Elastic deformation | 0.2 | 7 control points, maximum displacement 7 voxels |
 | Smooth bias field | 0.3 | Multiplicative intensity field |
 | Gaussian noise | 0.2 | Standard deviation sampled from 0 to 0.1 |
 
-MRI data use bilinear or trilinear interpolation for spatial transforms. Segmentation labels use nearest-neighbour interpolation.
+Spatial transforms use bilinear or trilinear interpolation for MRI intensities and nearest-neighbour interpolation for segmentation labels.
 
-Disable all training augmentation with:
-
-```bash
-python brats_pipeline.py --model unet3d --no_model_prompt --no_augment
-```
+Augmentation is applied only during training.
 
 ## Training defaults
-
-Important defaults include:
 
 | Setting | Default |
 | --- | --- |
@@ -186,7 +162,7 @@ Important defaults include:
 | Maximum epochs | 300 |
 | Early stopping patience | 30 validation epochs without improvement |
 | Validation interval | Every epoch |
-| Seed | 123 |
+| Main seed | 123 |
 | AMP | Enabled |
 | Gradient clipping | Maximum norm 1.0 |
 | DataLoader workers | 8 |
@@ -195,13 +171,13 @@ Important defaults include:
 | TF32 | Enabled |
 | `torch.compile` | Disabled by default |
 
-The selected checkpoint is the epoch with the best validation mean Dice.
+The checkpoint with the highest validation mean Dice is retained for final evaluation.
 
 ## Automatic batch-size tuning
 
-Automatic batch-size tuning is enabled by default. It performs real forward, backward, and optimiser probes and selects the largest stable physical batch that satisfies the configured CUDA memory policy.
+Automatic batch-size tuning is enabled by default. The tuner performs forward, backward, and optimiser probes and selects the largest stable physical batch satisfying the configured CUDA memory policy.
 
-Important defaults:
+Important defaults include:
 
 ```text
 Target VRAM fraction: 0.85
@@ -209,26 +185,20 @@ Minimum free VRAM headroom: 1 GB
 2D starting batch size: 64
 3D starting batch size: 1
 UNet2D hard cap: 64
-Diff-UNet hard cap: 1
+DiffUNet hard cap: 1
 DeepEnsemble member hard cap: 1
 ```
 
-The tuner performs a final forced-augmentation safety check and repeated memory-stability checks. Wall-clock timing variability is diagnostic only and does not cause batch-size rejection.
-
-Selected batch sizes are cached in:
+Selected batch sizes can be cached in:
 
 ```text
 runs/autobatch_cache.json
 ```
 
-Disable automatic tuning with:
+To disable automatic tuning:
 
 ```bash
-python brats_pipeline.py \
-  --model unet3d \
-  --no_model_prompt \
-  --no_auto_batch \
-  --batch_size 1
+python brats_pipeline.py   --model unet3d   --no_model_prompt   --no_auto_batch   --batch_size 1
 ```
 
 ## Memory-mapped preprocessing cache
@@ -241,7 +211,7 @@ Default location:
 <data_dir>/.brats_preprocessed_cache/
 ```
 
-Per patient, the main cache contains:
+Per patient, the main cache includes:
 
 ```text
 image_f16.npy
@@ -249,99 +219,64 @@ label_u8.npy
 foreground_by_z.npy
 ```
 
-The canonical 3D cache is stored at padded geometry `240 x 240 x 160`.
-
-For supported 2D paths, an optional axial slice-major cache is also created to reduce strided disk reads:
+For supported 2D paths, an axial slice-major cache can also be created:
 
 ```text
 image_axial_f16.npy
 label_axial_u8.npy
 ```
 
-The cache is disk-backed. Worker-local mmap handles and the operating-system file cache are used instead of loading the complete cohort into Python RAM.
-
-Disable preprocessing cache creation with:
-
-```bash
-python brats_pipeline.py \
-  --model unet3d \
-  --no_model_prompt \
-  --no_preprocessed_cache
-```
+The cache is disk-backed and avoids loading the complete cohort into Python RAM.
 
 ## Model-specific behaviour
 
-### UNet2D
+### UNet
 
-`unet2d` processes native axial slices of shape:
+`unet2d` operates on native axial slices of shape:
 
 ```text
 4 x 240 x 240
 ```
 
-The corrected default retains all native axial training slices:
+The final configuration retains all axial training slices, including tumour-free slices.
 
-```text
-unet2d_skip_empty_ratio = 0.0
-```
+During validation and testing, slice predictions are reassembled in their original axial order to reconstruct each complete patient volume before Dice and HD95 are calculated.
 
-The final held-out evaluation reconstructs each complete 3D patient before computing patient-level Dice and HD95.
+### Hybrid UNet / DenseVU-ED
 
-### HVU / DenseVU-ED
-
-`hvu` receives the same 240 x 240 axial slices but internally resizes them to:
+`hvu` receives 240 x 240 axial slices and internally resizes them to:
 
 ```text
 256 x 256
 ```
 
-Its bottleneck combines:
+Its bottleneck combines local U-Net features, DenseNet121 architectural features, and Vision Transformer features. The DenseNet branch is not initialised with pretrained weights.
 
-- U-Net local features
-- DenseNet121 architectural features
-- Vision Transformer global features
-
-The DenseNet branch is initialised without pretrained weights.
+During training, approximately 90% of tumour-free slices are excluded by the retained architecture-specific sampling procedure.
 
 ### DeepLabV3+
 
-`deeplabv3plus2d` uses:
+`deeplabv3plus2d` uses a ResNet-50 style encoder, output stride 16, atrous spatial pyramid pooling with rates 6, 12, and 18, and low-level feature fusion in the decoder. It is trained from scratch.
 
-- a ResNet-50 style encoder
-- output stride 16
-- atrous spatial pyramid pooling with rates 6, 12, and 18
-- low-level feature fusion in the decoder
-
-It is trained from scratch.
+During training, approximately 90% of tumour-free slices are excluded by the retained sampling procedure.
 
 ### HybridAttUNet
 
-`hybridattunet` accepts the common padded full-volume input but internally resizes it to:
+`hybridattunet` accepts the padded full-volume input and internally resizes it to:
 
 ```text
 128 x 128 x 128
 ```
 
-The implementation includes:
+The implementation contains residual blocks, four residual-attention skip modules, and squeeze-excitation recalibration in the decoder.
 
-- residual bottleneck blocks
-- four residual-attention skip modules
-- attention depths 1, 2, 3, and 4
-- squeeze-excitation recalibration in the decoder
+Logits are resized back to the common pipeline geometry before the common loss and evaluation procedure.
 
-Logits are resized back to the pipeline input geometry before the common loss and evaluation.
+### DiffUNet
 
-### Diff-UNet
+`diff_unet` is a four-class adaptation of DiffUNet to the common experimental framework.
 
-`diff_unet` is a four-class adaptation of Diff-UNet.
-
-Training uses:
-
-- a separate 3D MRI image encoder
-- one-hot segmentation states mapped to `[-1, 1]`
-- random diffusion timesteps from `T = 1000`
-- START_X parameterisation
-- the same Dice plus categorical cross-entropy objective used by the other architectures
+Training uses a separate 3D MRI encoder, one-hot segmentation states mapped to `[-1, 1]`, diffusion timesteps sampled from `T = 1000`, START_X parameterisation, and the same Dice plus categorical cross-entropy objective used by the other models.
 
 Inference uses deterministic DDIM-style sampling with:
 
@@ -349,190 +284,370 @@ Inference uses deterministic DDIM-style sampling with:
 50 denoising steps
 ```
 
-Because of its full-volume memory requirement, its physical batch size is capped at 1 by default and asynchronous CUDA batch prefetch is disabled.
+MRI conditioning features are computed once and reused across the denoising sequence.
 
-### DeepEnsembled U-Net
+The implementation should be interpreted as the study-specific four-class adaptation evaluated in this repository rather than as an exact reproduction of the original published system.
 
-`deepensemble` trains five Henry-style 3D U-Net members sequentially using seeds:
+### 3DUNet
+
+`unet3d` is a conventional full-volume 3D U-Net operating on the padded 240 x 240 x 160 volume.
+
+### DeepEnsembled UNet
+
+`deepensemble` trains five independently initialised 3D members sequentially using seeds:
 
 ```text
 123, 124, 125, 126, 127
 ```
 
-Each member uses:
+Each member uses deep supervision during optimisation.
 
-- width 48
-- GroupNorm
-- a dilated pseudo-fifth stage
-- trilinear decoder upsampling
-- four deep-supervision outputs
-- activation checkpointing during training
-
-At inference, probabilities are averaged across all members. With default TTA enabled, each member is evaluated using 16 transformations:
+At inference, each member is evaluated with 16 test-time transformations and probabilities are averaged across transformations and members:
 
 ```text
-5 members x 16 TTA predictions = 80 predictions per patient
+5 members x 16 TTA predictions = 80 model evaluations per patient
 ```
 
-Disable DeepEnsemble TTA with:
-
-```bash
-python brats_pipeline.py \
-  --model deepensemble \
-  --no_model_prompt \
-  --no_deepensemble_tta
-```
+No SWA weight averaging or warm-restart ensemble procedure is used in the reported implementation.
 
 ## Evaluation metrics
 
-The pipeline reports patient-level metrics for:
+All final segmentation metrics are calculated at patient level.
 
-- Whole tumour, WT
-- Tumour core, TC
-- Enhancing tumour, ET
+### Dice
 
-### Dice coefficient
+Dice is reported for WT, TC, and ET.
 
-Dice is calculated from the reconstructed region masks.
-
-The reported overall Dice is:
+The overall patient-level mean is:
 
 ```text
-DiceMean = mean(DiceWT, DiceTC, DiceET)
+DiceMean = (DiceWT + DiceTC + DiceET) / 3
+```
+
+The implementation uses smoothing of `1e-5`.
+
+```text
+Prediction empty and target empty -> Dice = 1
+Only one mask empty              -> Dice approaches 0
 ```
 
 ### HD95
 
-HD95 is computed from the symmetric set of nearest surface distances and reported in voxel units.
+HD95 is the symmetric 95th percentile of the pooled nearest-surface distances in both directions.
 
-Empty-mask handling is:
+The implementation uses SciPy Euclidean distance transforms and reports distances in voxel units. Because the BraTS2020 images are at 1 mm isotropic resolution, one voxel corresponds to 1 mm in the reported dataset geometry.
 
 ```text
 Prediction empty and target empty -> 0
 Only one mask empty              -> NaN
-Both masks non-empty             -> HD95 calculated
+Both masks non-empty             -> symmetric HD95 calculated
 ```
 
-NaN values are excluded from summary means.
+NaN values are excluded from the corresponding HD95 summary mean.
 
-The reported overall HD95 is the mean of the valid WT, TC, and ET HD95 values for each patient.
+For the 2D architectures, final Dice and HD95 are not calculated slice by slice. All axial predictions are first reassembled into the complete 3D patient volume.
 
 ## Computational metrics
 
-The fixed-split experiment also reports:
-
-| Metric | Meaning |
+| Metric | Definition |
 | --- | --- |
-| `Training time (s)` | Total wall-clock training time to the selected stopping point |
-| `Trainable Params` | Number of trainable model parameters |
-| `GFLOPs` | Complete patient-level inference workload, multiply-add counted as 2 FLOPs |
-| `Dice/s` | Mean test Dice divided by inference time in seconds |
-| `Dice/M` | Mean test Dice divided by trainable parameters in millions |
-| `Inference (ms)` | Mean patient-level forward inference latency after warm-up |
-| `Peak VRAM (GB)` | Maximum allocated CUDA memory observed during training |
+| `Training time (s)` | Total wall-clock training time to the selected stopping point, including validation |
+| `Trainable Params` | Number of trainable parameters |
+| `GFLOPs` | Estimated complete patient-level forward inference workload |
+| `Dice/s` | Mean patient Dice divided by mean patient inference time in seconds |
+| `Dice/M` | Mean patient Dice divided by trainable parameters in millions |
+| `Inference (ms)` | Mean patient-level model forward latency after warm-up |
+| `Peak VRAM (GB)` | Maximum PyTorch allocated CUDA memory observed during training |
 
-For 2D architectures, per-slice FLOPs are accumulated over all slices evaluated for the patient.
+### GFLOPs implementation
 
-For Diff-UNet, GFLOPs include all 50 denoising evaluations.
+GFLOPs are estimated using custom PyTorch runtime forward hooks with profiling batch size 1.
 
-For the DeepEnsembled U-Net, GFLOPs and latency include all ensemble members and all enabled TTA transformations.
+The implementation counts:
+
+```text
+Conv2d
+Conv3d
+ConvTranspose2d
+ConvTranspose3d
+Linear
+MultiheadAttention
+```
+
+A multiply and an addition are counted as two FLOPs. Bias additions are included.
+
+The estimate covers forward inference only. Backward propagation is not included.
+
+Operations outside the explicitly hooked module types, including activation functions, normalisation, pooling, and softmax, are not included.
+
+For 2D architectures, one axial input is profiled and the operation count is scaled to complete patient-level inference.
+
+For 3D architectures, one complete padded patient volume is profiled.
+
+DiffUNet GFLOPs include the complete 50-step denoising procedure.
+
+DeepEnsembled UNet GFLOPs are scaled across all five members and all 16 TTA transformations per member.
+
+### Inference timing
+
+Inference timing uses CUDA events around the model forward operation.
+
+The benchmark performs three untimed warm-up evaluations for the single models. The DeepEnsembled UNet uses one complete untimed ensemble warm-up evaluation.
+
+Input transfer to the GPU occurs before the timed forward operation. CUDA is synchronised before elapsed time is read.
+
+The timed interval excludes data loading, preprocessing, host-to-device transfer, prediction transfer to CPU, 2D volumetric reconstruction, Dice calculation, HD95 calculation, and file writing.
+
+For 2D models, forward times of all slice batches are accumulated and converted to mean patient-level latency.
+
+Peak VRAM uses `torch.cuda.max_memory_allocated()` and should be interpreted as peak PyTorch allocated training memory, not as the minimum physical GPU capacity required for execution.
+
+## HybridAttUNet ablation study
+
+`Ablation.py` contains the controlled factorial ablation used to isolate the contributions of attention and residual connections.
+
+| CLI name | Attention | Residual blocks | Description |
+| --- | --- | --- | --- |
+| `hybridattunet` | Yes | Yes | Full reference HybridAttUNet |
+| `hybridattunet_no_attention` | No | Yes | Attention mechanisms removed |
+| `hybridattunet_no_residual` | Yes | No | Residual shortcuts removed from convolutional blocks |
+| `hybridattunet_no_attention_no_residual` | No | No | Attention and residual shortcuts removed |
+
+Run all four configurations sequentially on the same fixed patient split:
+
+```bash
+python Ablation.py   --run_all_hybrid_ablation   --data_dir /path/to/BraTS2020   --save_dir ./runs/ablation
+```
+
+Combined metrics are written to:
+
+```text
+hybridattunet_ablation_metrics.csv
+```
+
+An individual configuration can be run explicitly, for example:
+
+```bash
+python Ablation.py   --model hybridattunet_no_attention   --no_model_prompt   --data_dir /path/to/BraTS2020   --save_dir ./runs/ablation_no_attention
+```
+
+### Archived ablation outputs
+
+The reported ablation outputs are under:
+
+```text
+hybridattunet/ablation/
+```
+
+This includes:
+
+```text
+hybridattunet_ablation_metrics.csv
+final_test_per_patient_hybridattunet_no_attention.csv
+final_test_per_patient_hybridattunet_no_residual.csv
+final_test_per_patient_hybridattunet_no_attention_no_residual.csv
+final_test_summary_hybridattunet_no_attention.csv
+final_test_summary_hybridattunet_no_residual.csv
+final_test_summary_hybridattunet_no_attention_no_residual.csv
+```
+
+Run-specific subdirectories are also archived for:
+
+```text
+no_attention/
+no_residual/
+no_attention_no_residual/
+```
+
+The full reference HybridAttUNet run is archived in the parent `hybridattunet/` directory and in `results/`.
+
+## HybridAttUNet sensitivity study
+
+`Sensitivity.py` defines three executable pipeline-sensitivity conditions:
+
+| CLI name | Spatial condition | Augmentation |
+| --- | --- | --- |
+| `hybridatt_lowres` | 96^3 effective spatial information resampled to the unchanged 128^3 working grid | On |
+| `hybridatt_highres` | 160^3 HybridAttUNet internal working grid | On |
+| `hybridatt_ref_noaug` | Reference 128^3 internal grid | Off |
+
+The low-resolution condition preserves the reference network topology. The incoming volume is first resampled to 96^3, removing spatial information, then resampled to the unchanged 128^3 working grid before entering the reference architecture.
+
+Run all three executable sensitivity conditions sequentially:
+
+```bash
+python Sensitivity.py   --run_all_sensitivity   --data_dir /path/to/BraTS2020   --save_dir ./runs/sensitivity
+```
+
+The script writes:
+
+```text
+hybridattunet_sensitivity_manifest.json
+hybridattunet_sensitivity_metrics.csv
+```
+
+An individual condition can be run explicitly, for example:
+
+```bash
+python Sensitivity.py   --model hybridatt_ref_noaug   --no_model_prompt   --data_dir /path/to/BraTS2020   --save_dir ./runs/sensitivity_noaug
+```
+
+### Archived sensitivity outputs
+
+The archived manuscript sensitivity outputs are under:
+
+```text
+hybridattunet/sensitivity/
+```
+
+The patient-level and summary files present in this commit are:
+
+```text
+final_test_per_patient_hybridatt_lowres.csv
+final_test_summary_hybridatt_lowres.csv
+final_test_per_patient_hybridatt_ref_noaug.csv
+final_test_summary_hybridatt_ref_noaug.csv
+hybridattunet_sensitivity_metrics.csv
+```
+
+Run-specific folders are archived as:
+
+```text
+low_res/
+no_augmentation/
+```
+
+Important: `Sensitivity.py` supports `hybridatt_highres`, but commit `0bced1abbbc92b663092e3d2fbd23d1a4a6b8dac` does not contain an archived high-resolution patient-level or summary result. The archived manuscript sensitivity evidence in this commit consists of the low-resolution and no-augmentation conditions together with the reference HybridAttUNet result.
 
 ## Installation
 
-### Required packages
-
-The core pipeline requires:
+The repository contains:
 
 ```text
-numpy
-torch
-nibabel
-scipy
+requirements-lock.txt
 ```
 
-Additional packages used by specific features are:
-
-```text
-torchvision    # required for HVU / DenseVU-ED
-tqdm           # optional live progress bars
-tensorboard    # optional TensorBoard logging
-psutil         # optional host-memory reporting
-```
-
-A typical environment can be prepared with:
+Install the recorded Python packages with:
 
 ```bash
-pip install numpy nibabel scipy tqdm tensorboard psutil
+pip install -r requirements-lock.txt
 ```
 
-Install PyTorch and torchvision separately using the build appropriate for your GPU and CUDA environment.
+The lock file includes:
 
-For an RTX 5090 or another Blackwell-class GPU, the PyTorch build must include support for compute capability 12.0 (`sm_120` or `compute_120`). The script performs a CUDA allocation and matrix-multiplication sanity check before dataset preparation begins.
+```text
+torch==2.13.0+cu132
+torchvision==0.28.0+cu132
+```
 
-## Usage
+The pipeline requires a CUDA-capable PyTorch environment by default. CPU execution must be explicitly enabled with `--allow_cpu`, but full-volume 3D training on CPU is not expected to be practical.
 
-### List available models
+## Main benchmark usage
+
+List the available main models:
 
 ```bash
 python brats_pipeline.py --list_models
 ```
 
-### Interactive training
-
-Training mode opens a numbered model menu by default:
+Interactive training:
 
 ```bash
 python brats_pipeline.py --data_dir /path/to/BraTS2020
 ```
 
-Even if `--model` is supplied, the interactive menu remains the default unless `--no_model_prompt` is also used.
+For scripted training, supply both `--model` and `--no_model_prompt`:
 
-### Reproducing the reported experiments
-
-The experiments reported in the associated manuscript were re-executed using the fixed 80% training, 10% validation, and 10% final test protocol implemented in this repository.
-
-The reported reruns used the interactive training workflow. No architecture-specific command-line configuration was used for the manuscript reruns. After starting the pipeline, the required architecture was selected from the numbered model menu:
-
-```text
-1. UNet 2D
-2. HVU 2D / DenseVU-ED
-3. DeepLabV3+ 2D
-4. Diff-UNet 3D
-5. HybridAttUNet 3D
-6. UNet 3D
-7. DeepEnsembled U-Net 3D
+```bash
+python brats_pipeline.py   --mode train   --model unet3d   --no_model_prompt   --data_dir /path/to/BraTS2020   --save_dir ./runs
 ```
 
-The exact settings resolved for each run are preserved in the archived `config.json` files where available. These files provide the authoritative record of the settings used for those archived runs.
+DiffUNet example:
 
-The exact patient partition used across the experiments is archived at the repository root as:
+```bash
+python brats_pipeline.py   --model diff_unet   --no_model_prompt   --data_dir /path/to/BraTS2020
+```
+
+DeepEnsembled UNet example:
+
+```bash
+python brats_pipeline.py   --model deepensemble   --no_model_prompt   --data_dir /path/to/BraTS2020
+```
+
+### Resume training
+
+```bash
+python brats_pipeline.py   --model unet3d   --no_model_prompt   --data_dir /path/to/BraTS2020   --checkpoint runs/unet3d_YYYYMMDD_HHMMSS_fixed_80_10_10/last.pth
+```
+
+### Standalone evaluation
+
+```bash
+python brats_pipeline.py   --mode eval   --model unet3d   --data_dir /path/to/BraTS2020   --checkpoint /path/to/best.pth
+```
+
+The preferred manuscript-reproduction path is the fixed-split training workflow, which performs the held-out test evaluation automatically after checkpoint selection.
+
+## Optional legacy cross-validation mode
+
+The main pipeline retains an optional k-fold workflow:
+
+```bash
+python brats_pipeline.py   --model unet3d   --no_model_prompt   --data_dir /path/to/BraTS2020   --cv   --n_folds 10   --test_ratio 0.10
+```
+
+This mode is separate from the fixed 80/10/10 experiment and was not used for the reported manuscript results.
+
+The `--run_all_hybrid_ablation` and `--run_all_sensitivity` workflows are designed for the fixed-split experiment and reject legacy cross-validation mode.
+
+## Archived reproducibility material
+
+At commit `0bced1abbbc92b663092e3d2fbd23d1a4a6b8dac`, the repository root contains:
 
 ```text
+README.md
+brats_pipeline.py
+Ablation.py
+Sensitivity.py
 fixed_split.json
-```
-
-It contains the 295 training patients, 37 validation patients, and 37 final held-out test patients used in the reported analyses.
-
-The final patient-level and aggregate test results are archived in:
-
-```text
+requirements-lock.txt
+model_metrics.csv
+efficiency_metrics.csv
 results/
+unet/
+hybridunet/
+deeplabsv3/
+diff_unet/
+hybridattunet/
+unet3D/
+deepensemble/
 ```
 
-This directory contains `final_test_per_patient_<model>.csv` and `final_test_summary_<model>.csv` files for all seven architectures. The patient-level files contain the Dice and HD95 values used for the reported descriptive statistics and paired statistical comparisons.
+### Main patient-level results
 
-At repository commit `2bd62f6f66aa4e1a34c97eaf671b66ac53fe05e9`, run-specific artefacts are archived in the following architecture directories:
+The `results/` directory contains held-out patient-level results for all seven main architectures:
 
 ```text
-unet/              -> UNet 2D
-deeplabsv3/        -> DeepLabV3+ 2D
-diff_unet/         -> Diff-UNet 3D
-hybridattunet/     -> HybridAttUNet 3D
-unet3D/            -> UNet 3D
-deepensemble/      -> DeepEnsembled U-Net 3D
+final_test_per_patient_unet2d.csv
+final_test_per_patient_hvu.csv
+final_test_per_patient_deeplabv3plus2d.csv
+final_test_per_patient_diff_unet.csv
+final_test_per_patient_hybridattunet.csv
+final_test_per_patient_unet3d.csv
+final_test_per_patient_deepensemble.csv
 ```
 
-For the single-model architecture directories, the archived material includes:
+Corresponding aggregate files are stored as:
+
+```text
+final_test_summary_<model>.csv
+```
+
+These patient-level files contain the Dice and HD95 values used for the reported descriptive summaries and paired statistical comparisons.
+
+### Main run artefacts
+
+Where archived, architecture directories contain structured run evidence such as:
 
 ```text
 config.json
@@ -541,173 +656,40 @@ run_metrics.json
 fixed_split_experiment_summary.json
 ```
 
-`config.json` records the complete resolved configuration used for the archived run. `training_history.csv` provides the structured epoch-level training log, including training and validation losses, Dice and HD95 values, learning rate, timing measurements, memory measurements, and GPU telemetry where enabled. `run_metrics.json` records run-level information such as training duration, peak allocated VRAM, best epoch, validation performance, completed epochs, and stopping reason. `fixed_split_experiment_summary.json` records the patient counts, selected checkpoint, validation performance, and final held-out test performance.
+`config.json` records the resolved run configuration.
 
-For the DeepEnsembled U-Net, equivalent artefacts are provided separately for each of the five independently trained ensemble members in `Ensemble1` to `Ensemble5`, together with `ensemble_members.json` and the final fixed-split experiment summary.
+`training_history.csv` contains epoch-level training and validation metrics together with timing, memory, and GPU telemetry recorded during the run.
 
-The `hybridattunet/` directory additionally contains the ablation and sensitivity experiment outputs reported in the manuscript.
+`run_metrics.json` records run-level quantities such as training duration, best validation epoch, completed epochs, peak allocated VRAM, validation performance, and stopping reason.
 
-At this specific commit, final HVU patient-level and summary results are present in `results/`, but the corresponding run-specific HVU configuration and training-history directory is not included in the snapshot.
+`fixed_split_experiment_summary.json` records fixed-split patient counts, checkpoint information, validation performance, and held-out test performance.
 
-At the repository root, `model_metrics.csv` and `efficiency_metrics.csv` provide the aggregate predictive and computational measurements archived with the reported experiments.
+For the DeepEnsembled UNet, equivalent material is archived for the five independently trained members.
 
-### Non-interactive training
+Final Hybrid UNet / HVU patient-level and summary results are present in `results/`, but a corresponding run-specific HVU archive directory is not present in this commit.
 
-For scripted runs, supply both `--model` and `--no_model_prompt`:
+## Output files created by new runs
 
-```bash
-python brats_pipeline.py \
-  --mode train \
-  --model unet3d \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020 \
-  --save_dir ./runs
-```
-
-Example for UNet2D:
-
-```bash
-python brats_pipeline.py \
-  --model unet2d \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020 \
-  --epochs 300
-```
-
-Example for Diff-UNet:
-
-```bash
-python brats_pipeline.py \
-  --model diff_unet \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020
-```
-
-Example for the DeepEnsembled U-Net:
-
-```bash
-python brats_pipeline.py \
-  --model deepensemble \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020
-```
-
-### Explicit labelled training directory
-
-If automatic cohort detection is ambiguous:
-
-```bash
-python brats_pipeline.py \
-  --model hybridattunet \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020 \
-  --train_data_dir /path/to/BraTS2020/BraTS20_Training
-```
-
-### Resume training
-
-```bash
-python brats_pipeline.py \
-  --model unet3d \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020 \
-  --checkpoint runs/unet3d_YYYYMMDD_HHMMSS_fixed_80_10_10/last.pth
-```
-
-### Standalone evaluation
-
-A checkpoint can be loaded with:
-
-```bash
-python brats_pipeline.py \
-  --mode eval \
-  --model unet3d \
-  --data_dir /path/to/BraTS2020 \
-  --checkpoint /path/to/best.pth
-```
-
-The main fixed-split training workflow already performs the final held-out test evaluation automatically after selecting the best validation checkpoint.
-
-The standalone `Evaluator` path currently constructs a validation split from `--data_dir`, `--val_ratio`, and `--seed`. It should therefore not be confused with the one-time fixed 10% final-test evaluation performed automatically by `FixedSplitRunner`. The standalone evaluator also uses the volumetric dataset path directly, so the automatic fixed-split evaluation is the preferred evaluation route for the 2D architectures.
-
-## Optional cross-validation mode
-
-The file retains an optional k-fold workflow:
-
-```bash
-python brats_pipeline.py \
-  --model unet3d \
-  --no_model_prompt \
-  --data_dir /path/to/BraTS2020 \
-  --cv \
-  --n_folds 10 \
-  --test_ratio 0.10
-```
-
-This is separate from the default fixed 80/10/10 experiment and was not used to obtain the results reported in the manuscript.
-
-## Output files
-
-The default `save_dir` is:
+The default output directory is:
 
 ```text
 ./runs
 ```
 
-### Shared experiment outputs
-
-During execution, the pipeline can maintain:
+Typical shared outputs include:
 
 ```text
-runs/
-├── fixed_split.json
-├── autobatch_cache.json
-├── run.log
-├── segmentation_metrics.csv
-├── efficiency_metrics.csv
-├── model_metrics.csv
-├── final_test_per_patient_<model>.csv
-└── final_test_summary_<model>.csv
+fixed_split.json
+autobatch_cache.json
+run.log
+segmentation_metrics.csv
+efficiency_metrics.csv
+model_metrics.csv
+final_test_per_patient_<model>.csv
+final_test_summary_<model>.csv
 ```
 
-`segmentation_metrics.csv` contains one row per model with:
-
-```text
-Model
-DiceCoef
-HD95
-DiceET
-DiceWT
-DiceTC
-```
-
-`efficiency_metrics.csv` contains:
-
-```text
-Model
-Batch Size
-Training time (s)
-Trainable Params
-GFLOPs
-Dice/s
-Dice/M
-Inference (ms)
-Peak VRAM (GB)
-```
-
-`model_metrics.csv` combines both sets of columns.
-
-The per-patient final-test files are intended for paired architecture comparisons and statistical analysis.
-
-### Per-run outputs
-
-Each training run also creates a timestamped directory such as:
-
-```text
-runs/unet3d_YYYYMMDD_HHMMSS_fixed_80_10_10/
-```
-
-Typical contents include:
+Typical per-run outputs include:
 
 ```text
 config.json
@@ -718,97 +700,67 @@ fixed_split_experiment_summary.json
 tb/
 ```
 
-For the DeepEnsembled U-Net, each member receives its own run directory and the final ensemble directory also stores:
-
-```text
-best.pth
-ensemble_members.json
-```
-
-The repository snapshot does not archive every raw runtime file produced locally. In particular, the root `run.log`, model checkpoints, and TensorBoard event files are not included in commit `2bd62f6f66aa4e1a34c97eaf671b66ac53fe05e9`. The archived `training_history.csv`, `run_metrics.json`, fixed-split summaries, patient-level result files, and aggregate metric files provide the structured records retained for the reported reruns.
+Model checkpoints and TensorBoard event files generated locally are not necessarily included in the repository snapshot.
 
 ## Reproducibility notes
 
-- The reported experiments used a single fixed 80/10/10 patient-level split rather than cross-validation.
-- The exact split used for the reported reruns is archived as `fixed_split.json`.
-- The default random seed was `123`, with consecutive seeds used for the five DeepEnsemble members.
-- The reported reruns were initiated through the interactive numbered model-selection menu.
-- No architecture-specific command-line settings were used for the reported reruns.
-- Run-specific resolved settings are preserved in the archived `config.json` files where present.
-- Structured epoch-level training logs are preserved in the corresponding `training_history.csv` files.
-- Run-level measurements are preserved in `run_metrics.json` where present.
-- Final patient-level Dice and HD95 measurements for all seven architectures are provided in `results/`.
-- Validation was performed every epoch and was used for checkpoint selection and early stopping.
-- The final 10% test subset was evaluated only after model selection.
-- The official unlabelled BraTS2020 validation cohort was not used.
-- All architectures used the same four-class formulation and common combined loss.
-- Data augmentation was applied only during training.
-- Cross-validation functionality remains available in the source code as an optional legacy mode, but it was not used to obtain the results reported in the manuscript.
-- `torch.compile` was disabled by default.
+- The reported primary experiments use one fixed 80/10/10 patient-level split rather than cross-validation.
+- The exact split is archived as `fixed_split.json`.
+- The default primary seed is 123.
+- DeepEnsembled UNet members use seeds 123 to 127.
+- Validation is performed after every epoch.
+- Early stopping patience is 30 epochs.
+- The held-out test subset is evaluated only after model selection.
+- The official unlabelled BraTS2020 validation cohort is not used.
+- All main models use the same four-class formulation and combined Dice plus categorical cross-entropy loss.
+- Training augmentation is applied only to the training subset.
+- Patient-level outputs are available for paired statistical analysis.
+- `requirements-lock.txt` records the Python package versions available in this snapshot.
+- `Ablation.py` and `Sensitivity.py` were added in commit `0bced1abbbc92b663092e3d2fbd23d1a4a6b8dac`.
+- Optional cross-validation functionality remains in the source but was not used for the reported manuscript results.
+- `torch.compile` is disabled by default.
 
-## Hardware and performance notes
+## Hardware and interpretation
 
-The implementation includes several optimisations intended for large BraTS workloads on CUDA GPUs:
+The reported computational measurements were obtained on a single NVIDIA RTX 5090 with 32 GB VRAM.
 
-- AMP
-- fused AdamW where supported
-- TF32 where supported
-- cuDNN benchmarking
-- channels-last 3D memory format for selected CNNs
-- pinned-memory DataLoaders
-- asynchronous CUDA prefetch where memory permits
-- memory-mapped preprocessing
-- patient-grouped 2D batches
-- RAM-bounded DataLoader prefetch
-- activation checkpointing for DeepEnsemble members
-- explicit worker and CUDA cleanup at process exit
+Training time, inference latency, and memory utilisation depend on model structure, tensor geometry, software implementation, CUDA kernels, and accelerator characteristics. The observed computational ordering should therefore be interpreted as specific to the reported benchmark configuration rather than assumed to transfer unchanged to other hardware.
 
-CUDA is required by default to prevent accidental multi-hour CPU training. CPU execution must be explicitly enabled with:
+The repository does not provide direct profiling of memory bandwidth, arithmetic intensity, or kernel occupancy. The computational comparison is based on measured training time, forward inference latency, peak allocated GPU memory, parameter count, and estimated forward GFLOPs.
 
-```bash
---allow_cpu
-```
+The repository also does not establish deployment performance on commodity GPUs, CPUs, or other resource-constrained clinical hardware.
 
-Full-volume 3D training on CPU is not expected to be practical.
+## Scope of the implementations
 
-## Important interpretation notes
+This repository is intended for a controlled within-pipeline comparison. It is not an attempt to reproduce the individually optimised training pipelines of every source architecture.
 
-This is a controlled comparison pipeline, not an attempt to reproduce the individually optimised performance of every source architecture.
+Several architectures are adapted to the common experimental setting, including the common four-class output formulation, common loss, fixed patient split, common augmentation framework, common model-selection procedure, and full-volume BraTS geometry for the 3D comparison.
 
-Several architectures have been adapted to a common experimental setting:
-
-- four mutually exclusive output classes
-- common Dice plus categorical cross-entropy loss
-- fixed patient split
-- common augmentation framework
-- common model selection procedure
-- full-volume BraTS geometry for the 3D comparison
-
-Accordingly, results should be interpreted as the behaviour of these implementations under the shared protocol rather than as exact reproductions of the original published systems.
+Accordingly, results should be interpreted as the behaviour of these implementations under the shared protocol.
 
 In particular:
 
-- HybridAttUNet is an architecture-faithful PyTorch reimplementation rather than a bit-for-bit reproduction of unpublished source code.
-- Diff-UNet is adapted to four-class multi-class segmentation and the common study loss.
-- DeepEnsemble retains major Henry et al. architectural and inference elements but uses the study's fixed split and four-class formulation.
-- HVU / DenseVU-ED is implemented from the architectural description and uses no pretrained DenseNet weights.
+- HybridAttUNet is a PyTorch implementation based on the reported architecture rather than a bit-for-bit reproduction of unavailable source code.
+- DiffUNet is adapted to four-class segmentation and the common study loss and uses 50-step deterministic DDIM-style inference.
+- DeepEnsembled UNet uses the study's independently trained members, deep supervision, fixed split, and TTA inference procedure.
+- Hybrid UNet / DenseVU-ED is implemented from the architectural description and does not use pretrained DenseNet weights.
 
 ## References represented in the implementation
 
-The source code explicitly draws on or adapts ideas from:
+The source code draws on or adapts ideas from:
 
 - Ronneberger et al., U-Net
-- Çiçek et al., 3D U-Net
+- Cicek et al., 3D U-Net
 - Renugadevi et al., DenseVU-ED / Hybrid Vision U-Net
-- Hybrid Attention-Based Residual U-Net
+- Khan et al., Hybrid Attention-Based Residual U-Net
 - Henry et al., BraTS2020 deep ensemble
-- Xing et al., Diff-UNet
-- DeepLabV3+
+- Xing et al., DiffUNet
+- Chen et al., DeepLabV3+
 
-Consult the associated papers and repositories when using the models for research reporting.
+Consult the corresponding publications when describing architectural provenance.
 
 ## Licence
 
-No licence is declared by this pipeline file itself. Before redistributing the code or model implementations, ensure that your repository licence is compatible with the licences of any source projects, dependencies, and datasets on which the implementations are based.
+No repository licence is declared in this commit. Before redistributing the code or model implementations, ensure that use is compatible with the licences of the underlying dependencies, source projects, and BraTS data.
 
 BraTS data are distributed separately and are not included in this repository.
