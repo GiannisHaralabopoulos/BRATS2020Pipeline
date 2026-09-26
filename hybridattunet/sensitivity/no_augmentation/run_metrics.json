@@ -1,0 +1,22 @@
+{
+  "model": "hybridatt_ref_noaug",
+  "training_time_s": 45589.0286257,
+  "trainable_params": 14098912,
+  "trainable_params_m": 14.098912,
+  "peak_vram_gb": 18.18093967437744,
+  "best_epoch": 84,
+  "best_dice": 0.8153538289338172,
+  "best_val_metrics": {
+    "loss": 0.16123880395615423,
+    "dice_WT": 0.9011411876291842,
+    "hd95_WT": 8.419524349060497,
+    "dice_TC": 0.8221826166996948,
+    "hd95_TC": 10.201201108238827,
+    "dice_ET": 0.7227376824725728,
+    "hd95_ET": 7.132425613510558,
+    "dice_mean": 0.8153538289338172,
+    "hd95_mean": 8.584383690269961
+  },
+  "epochs_completed": 114,
+  "stop_reason": "early_stopping"
+}

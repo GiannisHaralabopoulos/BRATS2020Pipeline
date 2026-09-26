@@ -1,0 +1,3 @@
+Model,DiceCoef,HD95,DiceET,DiceWT,DiceTC,Batch Size,Training time (s),Trainable Params,GFLOPs,Dice/s,Dice/M,Inference (ms),Peak VRAM (GB)
+Low Resolution,0.8365,4.8595,0.7997,0.8925,0.8173,1,27621.244,14098912,682.5768,14.04558,0.05933,59.5553,27.8649
+Reference No Augmentation,0.8375,4.7476,0.7561,0.9031,0.8531,1,45589.029,14098912,682.5768,14.172637,0.059399,59.0899,18.1809

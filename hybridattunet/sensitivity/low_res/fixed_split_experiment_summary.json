@@ -1,0 +1,21 @@
+{
+  "model": "hybridatt_lowres",
+  "design": "80% train / 10% validation / 10% final test from labelled BraTS cohort",
+  "train_n": 295,
+  "validation_n": 37,
+  "final_test_n": 37,
+  "best_epoch": 39,
+  "stop_reason": "early_stopping",
+  "best_validation_dice": 0.8046727832906463,
+  "sensitivity_condition": "Low Resolution",
+  "hybridatt_internal_size": 128,
+  "hybridatt_effective_input_size": 96,
+  "training_augmentation_enabled": true,
+  "deepensemble_members": 1,
+  "deepensemble_tta": false,
+  "final_test_dice": 0.8364891891891891,
+  "final_test_hd95": 4.859537837837838,
+  "gflops_definition": "forward inference GFLOPs per complete patient (multiply-add = 2 FLOPs)",
+  "split_file": "runs\\fixed_split.json",
+  "best_checkpoint": "runs\\hybridatt_lowres_20260914_022836_fixed_80_10_10\\best.pth"
+}

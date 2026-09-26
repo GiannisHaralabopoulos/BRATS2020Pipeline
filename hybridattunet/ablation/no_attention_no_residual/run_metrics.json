@@ -1,0 +1,22 @@
+{
+  "model": "hybridattunet_no_attention_no_residual",
+  "training_time_s": 18266.5419746,
+  "trainable_params": 5239140,
+  "trainable_params_m": 5.23914,
+  "peak_vram_gb": 12.65494680404663,
+  "best_epoch": 25,
+  "best_dice": 0.8063892573750362,
+  "best_val_metrics": {
+    "loss": 0.16382786248986786,
+    "dice_WT": 0.8737118373204271,
+    "hd95_WT": 5.189178707851797,
+    "dice_TC": 0.8015966037112177,
+    "hd95_TC": 6.1427674225662905,
+    "dice_ET": 0.7438593310934636,
+    "hd95_ET": 3.5392579718677477,
+    "dice_mean": 0.8063892573750362,
+    "hd95_mean": 4.957068034095278
+  },
+  "epochs_completed": 55,
+  "stop_reason": "early_stopping"
+}

@@ -1,0 +1,19 @@
+{
+  "model": "hybridattunet_no_attention_no_residual",
+  "design": "80% train / 10% validation / 10% final test from labelled BraTS cohort",
+  "train_n": 295,
+  "validation_n": 37,
+  "final_test_n": 37,
+  "best_epoch": 25,
+  "stop_reason": "early_stopping",
+  "best_validation_dice": 0.8063892573750362,
+  "hybrid_attention_enabled": false,
+  "hybrid_residual_blocks_enabled": false,
+  "deepensemble_members": 1,
+  "deepensemble_tta": false,
+  "final_test_dice": 0.7416567567567567,
+  "final_test_hd95": 7.70891081081081,
+  "gflops_definition": "forward inference GFLOPs per complete patient (multiply-add = 2 FLOPs)",
+  "split_file": "runs\\fixed_split.json",
+  "best_checkpoint": "runs\\hybridattunet_no_attention_no_residual_20260911_141222_fixed_80_10_10\\best.pth"
+}
